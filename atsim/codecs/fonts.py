@@ -31,7 +31,10 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 
-from fontTools.ttLib import TTFont
+try:
+    from fontTools.ttLib import TTFont
+except ImportError:
+    TTFont = None  # type: ignore[assignment,misc]
 
 
 @dataclass
@@ -108,6 +111,10 @@ FONTS: dict[str, FontSpec] = {
         key="osd", label="VCR OSD Mono（仅英文/数字）",
         path=r"C:\Users\Administrator\Downloads\字体\字体\VCR-OSD-Mono\VCR-OSD-Mono\VCR-OSD-MONO-1-001-1.ttf",
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\consolab.ttf"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\consola.ttf"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\courbd.ttf"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\cour.ttf"),
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
@@ -117,6 +124,8 @@ FONTS: dict[str, FontSpec] = {
         key="lyusung", label="柳宋（中英文数字）",
         path=r"C:\Users\Administrator\Downloads\字体\字体\柳宋_猫啃网\柳宋\Lyusung-210618.ttf",
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simsun.ttc"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simkai.ttf"),
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         ),
@@ -125,6 +134,8 @@ FONTS: dict[str, FontSpec] = {
         key="apos", label="A-POS 点阵（中英文数字）",
         path=r"C:\USERS\ADMINISTRATOR\APPDATA\LOCAL\MICROSOFT\WINDOWS\FONTS\A-POS点阵修改后.TTF",
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simsun.ttc"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simhei.ttf"),
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
         ),
@@ -133,6 +144,8 @@ FONTS: dict[str, FontSpec] = {
         key="ocr_a", label="OCR-A（机器可读，OSD 经典）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\OCR-A BT.ttf"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\OCRAEXT.TTF"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\consola.ttf"),
             "/usr/share/fonts/truetype/noto/NotoMono-Regular.ttf",
             "/usr/share/fonts/truetype/noto/NotoSansMono-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
@@ -142,6 +155,8 @@ FONTS: dict[str, FontSpec] = {
         key="ocr_b", label="OCR-B（机器可读）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\OCR-B 10 BT.ttf"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\consola.ttf"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\cour.ttf"),
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
         ),
@@ -150,6 +165,8 @@ FONTS: dict[str, FontSpec] = {
         key="ming", label="Ming-Imperial（中文点阵明体）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\Ming-Imperial-1.ttf"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\mingliub.ttc"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simsun.ttc"),
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
         ),
@@ -158,6 +175,8 @@ FONTS: dict[str, FontSpec] = {
         key="ocr_a_ext", label="OCR-A 扩展（机器可读宽体）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\OCRAEXT.TTF"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\consolab.ttf"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\consola.ttf"),
             "/usr/share/fonts/truetype/noto/NotoSansMono-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
         ),
@@ -182,6 +201,7 @@ FONTS: dict[str, FontSpec] = {
         key="msmincho", label="MS 明朝（日系录像机/DV 点阵明体）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\MSMINCHO.TTF"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simsun.ttc"),
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         ),
@@ -190,6 +210,7 @@ FONTS: dict[str, FontSpec] = {
         key="msgothic", label="MS 哥特（索尼/松下日系 OSD 点阵）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\msgothic.ttc"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simhei.ttf"),
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
         ),
@@ -198,6 +219,7 @@ FONTS: dict[str, FontSpec] = {
         key="mingliu", label="细明体 MingLiU（港台录像带繁体点阵）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\mingliub.ttc"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simsun.ttc"),
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         ),
@@ -222,6 +244,8 @@ FONTS: dict[str, FontSpec] = {
         key="gothic", label="Century Gothic（老式几何无衬线）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\GOTHIC.TTF"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\arialbd.ttf"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\arial.ttf"),
             "/usr/share/fonts/opentype/urw-base35/URWGothic-Demi.otf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
         ),
@@ -230,6 +254,7 @@ FONTS: dict[str, FontSpec] = {
         key="sony_tall_osd", label="Sony Handycam 窄高体（摄像机液晶寻像器 OSD）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\msgothic.ttc"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simhei.ttf"),
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
         ),
@@ -266,6 +291,8 @@ FONTS: dict[str, FontSpec] = {
         key="cctv_timecode", label="CCTV 监控时间码（BNC 画面分割器等宽数字）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\courbd.ttf"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\cour.ttf"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\consolab.ttf"),
             "/usr/share/fonts/opentype/urw-base35/NimbusMonoPS-Bold.otf",
             "/usr/share/fonts/truetype/liberation/LiberationMono-Bold.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono-Bold.ttf",
@@ -276,6 +303,7 @@ FONTS: dict[str, FontSpec] = {
         key="docu_biaosong", label="80年代纪录片大标宋（片头光学重衬线印字）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\STZHONGS.TTF"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simsun.ttc"),
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
         ),
@@ -316,6 +344,7 @@ FONTS: dict[str, FontSpec] = {
         key="docu_fangsong", label="传统铅印仿宋体（历史文献与卷首语字幕）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\simfang.ttf"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simsun.ttc"),
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
         ),
@@ -326,6 +355,7 @@ FONTS: dict[str, FontSpec] = {
         key="docu_kaishu", label="传统碑刻楷体（纪实人文题跋字幕）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\simkai.ttf"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simsun.ttc"),
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
         ),
@@ -336,6 +366,8 @@ FONTS: dict[str, FontSpec] = {
         key="docu_weibei", label="80年代片头魏碑体（金石刀刻重骨片头字）",
         path=os.path.expandvars(r"C:\\WINDOWS\\Fonts\\STXINWEI.TTF"),
         fallbacks=(
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simhei.ttf"),
+            os.path.expandvars(r"C:\WINDOWS\Fonts\simsun.ttc"),
             "/usr/share/fonts/opentype/noto/NotoSerifCJK-Bold.ttc",
             "/usr/share/fonts/opentype/noto/NotoSansCJK-Bold.ttc",
         ),
@@ -420,27 +452,29 @@ def _measure_cell(spec: "FontSpec") -> tuple[int, int, int]:
         return half, full, ascent
     except Exception:                                                 # noqa: BLE001
         # the fallback: the smallest advance that occurs more than once, doubled for full width
-        try:
-            f = TTFont(spec.path, fontNumber=0, lazy=True)
-            cmap = f.getBestCmap()
-            hmtx = f["hmtx"]
-            widths: dict[int, int] = {}
-            for c in range(0x20, 0x7F):
-                g = cmap.get(c)
-                if g and g in hmtx.metrics:
-                    widths[hmtx[g][0]] = widths.get(hmtx[g][0], 0) + 1
-            half = min(widths) if widths else upm // 2
-            full = half * 2
-            asc = int(f["hhea"].ascent)
-            f.close()
-            return half, full, asc
-        except Exception:                                             # noqa: BLE001
-            return upm // 2, upm, int(upm * 0.8)
+        if TTFont is not None:
+            try:
+                f = TTFont(spec.path, fontNumber=0, lazy=True)
+                cmap = f.getBestCmap()
+                hmtx = f["hmtx"]
+                widths: dict[int, int] = {}
+                for c in range(0x20, 0x7F):
+                    g = cmap.get(c)
+                    if g and g in hmtx.metrics:
+                        widths[hmtx[g][0]] = widths.get(hmtx[g][0], 0) + 1
+                half = min(widths) if widths else upm // 2
+                full = half * 2
+                asc = int(f["hhea"].ascent)
+                f.close()
+                return half, full, asc
+            except Exception:                                         # noqa: BLE001
+                pass
+        return upm // 2, upm, int(upm * 0.8)
 
 
 def load_font(key: str) -> FontSpec:
     """
-    Read a font's coverage and cell metrics, tolerating a malformed table.
+    Read a font's coverage and cell metrics, tolerating a malformed table or missing `fontTools`.
 
     `Lyusung` declares an `OS/2` table at format 5 and truncates it, so `fontTools` raises while
     decompiling. A rasteriser only needs `cmap`, `glyf` and `hmtx`, so the font is perfectly usable while
@@ -451,13 +485,26 @@ def load_font(key: str) -> FontSpec:
     if spec.covered:
         return spec
     if not os.path.exists(spec.path):
+        win_fonts = os.environ.get("WINDIR", r"C:\Windows") + r"\Fonts"
         cands = list(spec.fallbacks)
         if "cjk" in spec.scripts:
             cands.extend([
+                os.path.join(win_fonts, "simsun.ttc"),
+                os.path.join(win_fonts, "simhei.ttf"),
+                os.path.join(win_fonts, "msyh.ttc"),
+                os.path.join(win_fonts, "msgothic.ttc"),
+                "/System/Library/Fonts/PingFang.ttc",
+                "/System/Library/Fonts/STHeiti Light.ttc",
                 "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
                 "/usr/share/fonts/opentype/noto/NotoSerifCJK-Regular.ttc",
             ])
         cands.extend([
+            os.path.join(win_fonts, "consola.ttf"),
+            os.path.join(win_fonts, "cour.ttf"),
+            os.path.join(win_fonts, "lucon.ttf"),
+            os.path.join(win_fonts, "arial.ttf"),
+            "/System/Library/Fonts/Menlo.ttc",
+            "/System/Library/Fonts/Monaco.ttf",
             "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
             "/usr/share/fonts/truetype/liberation/LiberationMono-Regular.ttf",
         ])
@@ -467,27 +514,39 @@ def load_font(key: str) -> FontSpec:
                 break
         else:
             raise FileNotFoundError(spec.path)
-    f = TTFont(spec.path, fontNumber=0, lazy=True)
-    try:
-        spec.units_per_em = int(f["head"].unitsPerEm)
-        spec.glyph_count = int(f["maxp"].numGlyphs)
+
+    if TTFont is not None:
+        f = TTFont(spec.path, fontNumber=0, lazy=True)
         try:
-            hhea = f["hhea"]
-            spec.descent = int(hhea.descent)
-            if not spec.ascent:
-                spec.ascent = int(hhea.ascent)
-        except Exception:                                             # noqa: BLE001
-            spec.descent = 0
-            if not spec.ascent:
-                spec.ascent = int(spec.units_per_em * 0.8)
-        cmap = f.getBestCmap()
+            spec.units_per_em = int(f["head"].unitsPerEm)
+            spec.glyph_count = int(f["maxp"].numGlyphs)
+            try:
+                hhea = f["hhea"]
+                spec.descent = int(hhea.descent)
+                if not spec.ascent:
+                    spec.ascent = int(hhea.ascent)
+            except Exception:                                         # noqa: BLE001
+                spec.descent = 0
+                if not spec.ascent:
+                    spec.ascent = int(spec.units_per_em * 0.8)
+            cmap = f.getBestCmap()
+            if "cjk" not in spec.scripts:
+                spec.covered = {cp for cp in cmap.keys() if cp < 0x2E80}
+            else:
+                spec.covered = set(cmap.keys())
+            spec.half_advance, spec.full_advance, spec.ascent = _measure_cell(spec)
+        finally:
+            f.close()
+    else:
+        # Graceful Pillow-only fallback when fontTools is not installed
+        spec.units_per_em = 1000
+        spec.glyph_count = 65535
+        spec.descent = -200
         if "cjk" not in spec.scripts:
-            spec.covered = {cp for cp in cmap.keys() if cp < 0x2E80}
+            spec.covered = set(range(0x20, 0x2E80))
         else:
-            spec.covered = set(cmap.keys())
+            spec.covered = set(range(0x20, 0x10000))
         spec.half_advance, spec.full_advance, spec.ascent = _measure_cell(spec)
-    finally:
-        f.close()
     return spec
 
 

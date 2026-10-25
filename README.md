@@ -13,11 +13,11 @@
 本项目核心采用纯 Python 标准库提供 HTTP/WebUI 服务，无需安装 Flask、FastAPI 或 Node.js 前端构建链：
 
 - **Python**：`3.11+`
-- **Python 科学计算依赖**：`numpy`、`scipy`、`Pillow`
+- **Python 核心依赖**：`numpy`、`scipy`、`Pillow`、`fonttools`（`fonttools` 用于硬件字幕机 TrueType 字体表 `cmap`/`hmtx` 度量解析；最新版 `atsim/codecs/fonts.py` 已支持无 `fonttools` 自动降级回退至 `Pillow`）
 - **系统多媒体工具**（需位于系统 `PATH` 中，用于视频流读写与离线长片编码）：`ffmpeg`、`ffprobe`
 
 ```bash
-pip install numpy scipy Pillow
+pip install numpy scipy Pillow fonttools
 ```
 
 ### 2. 启动与管理 WebUI 服务（推荐使用 `server.py`）
@@ -131,7 +131,7 @@ python tools/measure_response.py
 
 `05 显示设备` 层不仅模拟电子束与荧光粉，还还原了显像管外围的高压电路、电磁场偏转与光学重拍几何：
 
-- **Sony Trinitron KV-1214 (1978) 4K 级物理还原**：支持高达 $3840\times 2160$ 的子像素级荫栅（Aperture Grille）垂直连续蛍光条、单枪三束（One-Gun Three-Beam）汇聚特性、深色玻璃面板内反射光晕与高压包（EHT）随亮场负载跌落的画面呼吸膨胀。
+- **Sony Trinitron KV-1214 (1978) 4K 级物理还原**：支持高达 $3840\times 2160$ 的子像素级荫栅（Aperture Grille）垂直连续荧光条、单枪三束（One-Gun Three-Beam）汇聚特性、深色玻璃面板内反射光晕与高压包（EHT）随亮场负载跌落的画面呼吸膨胀。
 - **强磁铁洛伦兹力旋涡与 PTC 消磁线圈**：支持在屏幕任意归一化坐标 $(x,y)$ 放置钕铁硼强磁铁并调节磁极距离 $z$。电子束在洛伦兹力 $\mathbf{F} = -e(\mathbf{v} \times \mathbf{B})$ 作用下产生带旋涡扭曲的几何位移，且因错位轰击相邻 RGB 荧光条而产生剧烈的彩虹色纯斑（Purity Ring）；触发消磁开关后，模拟 50/60Hz 交变衰减磁场与 PTC 热敏电阻热惯性，完整还原画面震荡发散再恢复纯净的消磁过程。
 - **相机翻拍 CRT 屏幕（Camera-off-CRT Reshoot）**：当使用数码相机或摄像机直接拍摄 CRT 屏幕时，相机快门时间与 CRT 场扫描周期拍频形成移动的水平快门滚道黑带（Shutter Roll Bar），而镜头透视投影网格与显像管荫罩间距在非整数倍缩放下产生真实的彩色空间拍频摩尔纹（Moiré Pattern）。
 
@@ -269,9 +269,12 @@ Virtual-Media-Lab/
 
 ## 九、常见问题排查（FAQ）
 
-1. **为什么选择了分屏预设并将文字设为「不要文字（纯净）」，画面中间之前还会有 `BUFFERING...`？**
+1. **在其他电脑上启动时报 `ModuleNotFoundError: No module named 'fontTools'` 怎么办？**
+   - **最快一行解决**：在终端执行 `pip install fonttools` 即可立即启动。
+   - **根因与代码级免依赖修复**：`atsim/codecs/fonts.py` 原本在顶层直接导入了 `from fontTools.ttLib import TTFont` 用于解析 TrueType 字体的 `cmap` 与 `hmtx` 表。最新更新的 `atsim/codecs/fonts.py` 已将 `fontTools` 改为可选依赖（未安装时自动回退至 `Pillow` 的 `ImageFont` 度量），并补齐了跨机器的 Windows（`C:\Windows\Fonts\consola.ttf` / `simsun.ttc` 等）、macOS 与 Linux 系统字体回退链，即使目标电脑没有安装 `fonttools` 或自定义字体文件也能直接启动运行。
+2. **为什么选择了分屏预设并将文字设为「不要文字（纯净）」，画面中间之前还会有 `BUFFERING...`？**
    在早期的流媒体模式中，`BUFFERING...` 是流媒体播放器内部生成的 OSD 图层。现已实现全链路联动：当顶部工具栏或参数面板将分屏文字模式设为 **「不要文字（纯净）」**（`text=0`）时，引擎会自动穿透抑制流媒体缓冲提示文字、重传平台水印横幅与所有分屏角标，输出 100% 纯净的物理磨损画面。
-2. **如何在保持画面效果完全不变的前提下获得最快的调参响应？**
+3. **如何在保持画面效果完全不变的前提下获得最快的调参响应？**
    - 日常调参时将预览分辨率保持在 `0.50x 标准` 或 `0.25x 极速`；
    - 使用 `❖ 分屏 / 分框 / 文字` 栏中的 **「↖ 左上 1 ~ ↘ 右下 4」** 单角检视按钮（仅计算 1/4 链路），调好后再切回 `⊞ 2×2 四分屏` 或点击 **「批量四连拍 (4张)」** 导出高清原图；
    - 调节后端显示层（CRT、扫描线、磁铁消磁）时无需关闭前端阶段，渲染器会自动复用上游阶段缓存。
