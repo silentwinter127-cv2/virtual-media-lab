@@ -1217,7 +1217,7 @@ def check_mpeg1_branch() -> None:
 # Checks that are cheap enough to run with `--quick`.  A check not listed here is
 # skipped under `--quick`, deliberately: a missing check is visible, an accidentally
 # included slow one is not.
-QUICK = ("check_consistency", "check_engine", "check_presets", "check_shuttle", "check_rf_tv_dx_subsystem", "check_crt_physics_realism", "check_sync_and_power_systems", "check_crt_reshoot_system", "check_transport_servo_system", "check_analog_switcher_system", "check_broadcast_scopes_system", "check_trv310e_and_vhs_head_calibration", "check_patchbay_da_system", "check_multiview_and_test_generator_systems", "check_ccu_genlock_and_master_playout_systems", "check_transfer_and_editing_systems", "check_automation_satellite_transmitter_systems")
+QUICK = ("check_consistency", "check_engine", "check_presets", "check_shuttle", "check_rf_tv_dx_subsystem", "check_crt_physics_realism", "check_sync_and_power_systems", "check_crt_reshoot_system", "check_transport_servo_system", "check_analog_switcher_system", "check_broadcast_scopes_system", "check_trv310e_and_vhs_head_calibration", "check_patchbay_da_system", "check_multiview_and_test_generator_systems", "check_ccu_genlock_and_master_playout_systems", "check_transfer_and_editing_systems", "check_automation_satellite_transmitter_systems", "check_audio_simulation_and_av_sync")
 
 
 def _discover_checks() -> list[str]:
@@ -4848,7 +4848,138 @@ def check_audio_simulation_and_av_sync() -> None:
            f"lr_diff={lr_diff:.6f}, peak={peak_j27:.4f}, mode={sim_j27.resolve_mode_name()}",
            lr_diff < 1e-6 and 0.65 <= peak_j27 <= 0.74 and sim_j27.resolve_mode_name() == "rf_pal_d_mono")
 
+    # 7. All 10 New Audio Subsystems & Unified A/V Clock Synchronization Verification
+    from atsim.codecs.audio import (
+        MicPreampFrontendSpec, apply_mic_preamp_frontend,
+        MobileSpeakerSimSpec, apply_mobile_speaker_sim,
+        DigitalSamplingSpec, apply_digital_sampling_converter,
+        PerceptualCodecSpec, apply_perceptual_audio_codec,
+        TelecomVoiceSpec, apply_telecom_voice_channel,
+        AcousticSpaceSpec, apply_acoustic_space_simulator,
+        SystemAudioChainSpec, apply_system_audio_chain,
+        MobileRingtoneSynthSpec, apply_mobile_ringtone_synth,
+        LoudnessProcessorSpec, measure_ebu_r128_loudness, apply_broadcast_platform_loudness,
+        AVSyncClockSpec, compute_av_sync_frame_map, apply_av_sync_clock_system, AVSyncClockStage,
+    )
+    from atsim.render.renderer import FrameBuffer, RenderContext
 
+    # 01: Mic Preamp Frontend (off-axis polar diffraction + AGC + clipping)
+    pcm_mic_on, _ = apply_mic_preamp_frontend(
+        sig_st, MicPreampFrontendSpec(mic_type=2, polar_pattern=4, off_axis_deg=0.0, agc_amount=0.3), sr=sr, seed=101
+    )
+    pcm_mic_off, _ = apply_mic_preamp_frontend(
+        sig_st, MicPreampFrontendSpec(mic_type=2, polar_pattern=4, off_axis_deg=90.0, agc_amount=0.3), sr=sr, seed=101
+    )
+    rms_on = float(np.sqrt(np.mean(pcm_mic_on ** 2)))
+    rms_off = float(np.sqrt(np.mean(pcm_mic_off ** 2)))
+    record("01 mic preamp frontend & polar pattern", "shotgun mic attenuates 90-deg off-axis signal vs on-axis",
+           f"rms_on={rms_on:.4f}, rms_off={rms_off:.4f}", rms_on > rms_off * 1.35)
+
+    # 02: Mobile Speaker & Earpiece Sim (Earpiece narrowband vs Feature Phone speaker)
+    pcm_ear, _ = apply_mobile_speaker_sim(
+        chirp_pcm, MobileSpeakerSimSpec(mode=1, drive_spl=0.5, cavity_resonance=0.45), sr=sr
+    )
+    pcm_fspk, _ = apply_mobile_speaker_sim(
+        chirp_pcm, MobileSpeakerSimSpec(mode=2, drive_spl=0.8, cavity_resonance=0.7), sr=sr
+    )
+    record("02 mobile speaker & earpiece sim", "earpiece and handsfree speaker produce distinct mono/resonated signatures",
+           f"ear_rms={float(np.std(pcm_ear)):.4f}, spk_rms={float(np.std(pcm_fspk)):.4f}",
+           pcm_ear.shape == chirp_pcm.shape and float(np.std(pcm_fspk - pcm_ear)) > 0.02)
+
+    # 03: Digital Sampling & Format Converter (ZOH foldback aliasing & out-of-phase comb)
+    pcm_adc, _ = apply_digital_sampling_converter(
+        sig_st, DigitalSamplingSpec(enabled=True, sample_rate_hz=8000.0, bit_depth=8, resample_filter=2, dither_mode=0),
+        sr=sr, seed=303,
+    )
+    record("03 digital sampling & format converter", "8kHz 8-bit ZOH resampling quantizes and introduces staircase foldback",
+           f"diff={float(np.std(pcm_adc - sig_st)):.4f}", pcm_adc.shape == sig_st.shape and float(np.std(pcm_adc - sig_st)) > 0.01)
+
+    # 04: Perceptual Audio Codec (MP3/AAC/AMR Bark masking & multi-generation cascade)
+    pcm_mp3_g1, _ = apply_perceptual_audio_codec(
+        chirp_pcm, PerceptualCodecSpec(codec_type=1, bitrate_kbps=48.0, generations=1), sr=sr, seed=404
+    )
+    pcm_mp3_g4, _ = apply_perceptual_audio_codec(
+        chirp_pcm, PerceptualCodecSpec(codec_type=1, bitrate_kbps=48.0, generations=4), sr=sr, seed=404
+    )
+    err_g1 = float(np.mean((pcm_mp3_g1 - chirp_pcm) ** 2))
+    err_g4 = float(np.mean((pcm_mp3_g4 - chirp_pcm) ** 2))
+    record("04 perceptual audio codec & multi-gen", "4-generation 48kbps MP3 cascade degrades signal more than 1st generation",
+           f"mse_g1={err_g1:.5f}, mse_g4={err_g4:.5f}", err_g4 > err_g1)
+
+    # 05: Telecom & VoIP Voice Channel (GSM 217Hz buzz + VAD/DTX + PLC)
+    pcm_tel, _ = apply_telecom_voice_channel(
+        clean_pcm, TelecomVoiceSpec(mode=2, packet_loss_pct=12.0, plc_mode=1), sr=sr, seed=505
+    )
+    record("05 telecom & voip voice channel", "GSM/VoIP channel applies narrowband filtering, PLC, and 217Hz TDMA buzz",
+           f"rms={float(np.std(pcm_tel)):.4f}", pcm_tel.shape == clean_pcm.shape and float(np.std(pcm_tel)) > 0.01)
+
+    # 06: Acoustic Space & Mic Placement (Room modes + RT60 + occlusion)
+    pcm_room, _ = apply_acoustic_space_simulator(
+        clean_pcm, AcousticSpaceSpec(preset=2, mic_distance_m=2.5, rt60_s=0.9, occlusion=0.4),
+        sr=sr, seed=606,
+    )
+    record("06 acoustic space & mic placement", "3D room modal reverb & hand occlusion modify direct-to-reverberant response",
+           f"diff={float(np.std(pcm_room - clean_pcm)):.4f}", pcm_room.shape == clean_pcm.shape and float(np.std(pcm_room - clean_pcm)) > 0.01)
+
+    # 07: Player & System Audio Chain (KMixer SRC + 3.5mm ground-loose vocal cancel)
+    vocal_center = np.column_stack([sig_st[:, 0], sig_st[:, 0]]).astype(np.float32)
+    pcm_trs_loose, _ = apply_system_audio_chain(
+        vocal_center, SystemAudioChainSpec(preset=3, channel_map=3), sr=sr, seed=707
+    )
+    record("07 system audio chain & TRS ground fault", "loose 3.5mm ground cancels center-panned mono signal (L-R)",
+           f"in_rms={float(np.std(vocal_center)):.4f}, out_rms={float(np.std(pcm_trs_loose)):.4f}",
+           float(np.std(pcm_trs_loose)) < float(np.std(vocal_center)) * 0.25)
+
+    # 08: Ringtone, MIDI & Mobile Synth (Nokia buzzer & Yamaha FM polyphony)
+    pcm_ring, _ = apply_mobile_ringtone_synth(
+        clean_pcm, MobileRingtoneSynthSpec(mode=2, polyphony=4, mix=1.0), sr=sr, seed=808
+    )
+    record("08 mobile ringtone & MIDI FM synth", "Yamaha 4-op FM ringtone synthesizer generates valid polyphonic waveform",
+           f"rms={float(np.std(pcm_ring)):.4f}", pcm_ring.shape == clean_pcm.shape and float(np.std(pcm_ring)) > 0.02)
+
+    # 09: Broadcast & Web Loudness Processing (EBU R 128 LUFS & Loudness War brickwall)
+    pcm_loud, _ = apply_broadcast_platform_loudness(
+        clean_pcm * 0.25, LoudnessProcessorSpec(mode=1, target_lufs=-9.0, compressor_drive=0.85, true_peak_ceiling_dbtp=-1.0), sr=sr
+    )
+    m_in = measure_ebu_r128_loudness(clean_pcm * 0.25, sr)
+    m_out = measure_ebu_r128_loudness(pcm_loud, sr)
+    record("09 broadcast & web loudness processor", "broadcast multiband limiter raises integrated LUFS and reduces crest factor",
+           f"lufs_in={m_in['integrated_lufs']:.1f}, lufs_out={m_out['integrated_lufs']:.1f}",
+           m_out["integrated_lufs"] > m_in["integrated_lufs"] + 2.0)
+
+    # 10: A/V Sync & Clock System (PTS offset + ppm drift + video/audio stage sync)
+    av_params = SCHEMA.resolve_all({
+        "audio": {
+            "av_sync_enabled": 1.0,
+            "av_sync_offset_ms": 60.0,
+            "av_clock_drift_ppm": 300.0,
+            "av_frame_drop_rate": 0.15,
+            "av_drop_sync_mode": 0.0,
+            "av_edit_interval_s": 1.5,
+            "av_edit_splice_mode": 2.0,
+        }
+    })
+    av_spec = AVSyncClockSpec(
+        enabled=True, offset_ms=60.0, clock_drift_ppm=300.0,
+        frame_drop_rate=0.15, drop_sync_mode=0, edit_splice_mode=2, edit_interval_s=1.5,
+    )
+    fmap0 = compute_av_sync_frame_map(0, fps, av_params, seed=2025)
+    fmap29 = compute_av_sync_frame_map(29, fps, av_params, seed=2025)
+    pcm_av, av_ev = apply_av_sync_clock_system(clean_pcm, av_spec, sr=sr, fps=fps, start_s=0.0, params=av_params, seed=2025)
+    ctx_av = RenderContext(
+        std=r_lin.std,
+        params=av_params,
+        seed=2025, frame_count=30, fps=fps, width=180, height=120, preview=True, source=src_clip,
+    )
+    av_stage = AVSyncClockStage(ctx_av)
+    av_stage.prepare()
+    v_f0 = src_clip.frame(0)
+    v_buf = av_stage.apply(FrameBuffer(v_f0.copy(), None, 5, 5.0 / fps, r_lin.std, {}))
+    v_out = v_buf.rgb
+    drift_delta = float(fmap29["av_offset_ms"]) - float(fmap0["av_offset_ms"])
+    record("10 A/V sync & clock drift system", "300ppm clock drift accumulates linear A/V offset and AVSyncClockStage runs cleanly",
+           f"offset0={fmap0['av_offset_ms']:.2f}ms, drift_delta={drift_delta:.3f}ms, v_shape={v_out.shape}",
+           abs(float(fmap0["av_offset_ms"]) - 60.0) < 1.0 and drift_delta > 0.15 and v_out.shape == v_f0.shape and pcm_av.shape == clean_pcm.shape)
 
 
 def check_rf_tv_dx_subsystem() -> None:

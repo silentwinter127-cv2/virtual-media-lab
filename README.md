@@ -278,3 +278,21 @@ Virtual-Media-Lab/
    - 日常调参时将预览分辨率保持在 `0.50x 标准` 或 `0.25x 极速`；
    - 使用 `❖ 分屏 / 分框 / 文字` 栏中的 **「↖ 左上 1 ~ ↘ 右下 4」** 单角检视按钮（仅计算 1/4 链路），调好后再切回 `⊞ 2×2 四分屏` 或点击 **「批量四连拍 (4张)」** 导出高清原图；
    - 调节后端显示层（CRT、扫描线、磁铁消磁）时无需关闭前端阶段，渲染器会自动复用上游阶段缓存。
+
+
+## 🔊 音频系统扩展：10 大物理音频子系统与音画同步时钟架构
+
+本工程在 `atsim/codecs/audio.py`、`atsim/core/profiles.py`、`atsim/graph/graph.py`、`atsim/graph/executor.py` 与 WebUI (`atsim/web/server.py`, `atsim/web/static/app.js`) 中完整内置了 **10 个物理级音频子系统** 与 **全链路音画同步时钟引擎**：
+
+| 编号 | 子系统名称 | 核心物理与工程建模机制 | 关键参数前缀 / 节点 |
+| :--- | :--- | :--- | :--- |
+| **01** | **麦克风与录音前端** (`MicPreampFrontendSpec`) | 8 类换能器频响（直通、动圈 SM58、电容 U87、铝带 RCA44、驻极体电脑麦、碳粒电话麦、DV 机顶麦、直板功能机针孔 MEMS 麦）、5 种指向性极坐标图（全指向/心形/超心形/8字/枪式）与离轴高频孔径衍射滚降、等效自噪声底（EIN + JFET $1/f$ 粉噪）、前置放大增益、前端 AGC 呼吸抽吸效应、运放软削波/ADC 硬削波/整型溢出折返、近讲效应、喷麦气流冲击与机身马达/手持摩擦耦合 | `audio.mic_*`, `audio.proximity_effect`, `audio.plosive_pop` |
+| **02** | **旧手机扬声器与听筒** (`MobileSpeakerSimSpec`) | Thiele-Small 机电高通谐振频点 ($f_0$)、最大声压级与音圈大振幅非线性奇次/偶次谐波失真、纸盆分割振动、塑料机壳腔体箱音共振，以及听筒模式（贴耳窄带 300–3400 Hz）vs 背面免提外放（Nokia/山寨机大嗓门薄亮刺耳 + ALC 压限） | `audio.mobile_spk_*` |
+| **03** | **数字采样与音频格式转换** (`DigitalSamplingSpec`) | 采样率抽取与奈奎斯特折返混叠、重采样滤波器对比（Sinc 抗混叠 / 早期声卡线性插值 / Zero-Order Hold 无抗混叠阶梯）、比特深度量化（4–24 bit）、抖动对比（无抖动截断 / RPDF / TPDF / 噪声整形 TPDF）、立体声/单声道求和/L-R 反相抵消空洞、ADC 满量程削波、采样时钟漂移 (ppm) 与孔径抖动 (Jitter) | `audio.adc_*` |
+| **04** | **感知音频编码** (`PerceptualCodecSpec`) | 覆盖 MP3、AAC-LC/HE-AAC（含 SBR 高频重建伪影）、AMR-NB（3GPP 代数码激励线性预测）与流媒体低码率语音编码；基于 Bark 临界频带同时掩蔽效应分配比特（验证**同码率 $\neq$ 同听感损伤**）、建模高频空洞与水声“鸟鸣”伪影 (Birdies)、瞬态涂抹与预回声 (Pre-echo)，以及 1–8 代重复转码世代累积劣化 | `audio.pcodec_*` |
+| **05** | **移动电话与网络语音** (`TelecomVoiceSpec`) | 窄带语音 (300–3400 Hz) 与高清宽带语音 (50–7000 Hz) 切换、语音活动检测 (VAD) 截字、DTX 静音抑制与舒适噪声生成 (CNG)、Gilbert-Elliott 突发丢包与丢包隐藏（PLC 零填充断字 vs 基音周期冻结机器音拖尾）、声学回声消除 (AEC) 残余与双讲抽吸、谱减法降噪音乐水声 (Musical Noise)、217 Hz GSM TDMA 射频蜂音与自适应抖动缓冲变速 | `audio.telecom_*` |
+| **06** | **声学空间与麦克风位置** (`AcousticSpaceSpec`) | 三维矩形房间轴向驻波简正模 ($f_{n_x,n_y,n_z}$)、六壁镜像源早期反射与走廊平行墙颤动回声 (Flutter Echo)、墙面高频吸声系数、Sabine/Eyring 混响时间 ($RT_{60}$)、声源-麦克风距离（直达混响比 DRR + ISO 9613 空气吸收）、手捂/口袋物理遮挡闷音与典型环境底噪（小卧室/空旷走廊/教室/户外街区） | `audio.space_*` |
+| **07** | **播放器与系统音频链** (`SystemAudioChainSpec`) | 操作系统混音器增益与推满削波、Windows XP KMixer (44.1→48 kHz 线性插值 SRC) 与网页 Flash Player (22.05 kHz 降采样)、声道映射故障与 **3.5mm 耳机插头地线松动虚接（L-R 差模串扰导致中置人声消失的伴奏卡拉OK效应）**、系统图形 EQ 预设、3D 环绕扩展、DMA 环形缓冲区欠载卡顿 (Buffer Underrun) 与输出设备切换爆音 | `audio.sys_*` |
+| **08** | **铃声、MIDI 与移动音源** (`MobileRingtoneSynthSpec`) | Nokia 单音压电蜂鸣器方波铃声 (Monophonic Piezo Buzzer)、Yamaha MA-2/MA-3 (OPL) 4/16 和弦 FM 合成芯片、严格最大复音数限制 (1/4/16/64) 与硬件抢音截断 (Voice Stealing)、低比特 PCM 波表、音序器节拍时间量化抖动、阶梯包络以及实时输入音频转写复古铃声旋律 | `audio.ringtone_*` |
+| **09** | **广播与网络平台的响度处理** (`LoudnessProcessorSpec`) | 完整实现 ITU-R BS.1770-4 / EBU R 128 K 加权综合响度测量 (Integrated LUFS)、响度范围 (LRA)、峰值因子 (Crest Factor) 与 4 倍过采样真峰值检测 (True Peak dBTP)；模拟电台/电视多段响度大战压限器 (Optimod 风格)、视频平台自动响度归一化 (-14 / -16 / -23 LUFS 惩罚削减) 与多平台二次上传重编码动态坍塌 | `audio.loudness_*` |
+| **10** | **音视频同步与时钟系统** (`AVSyncClockSpec` / `AVSyncClockStage`) | 统一视频帧时间戳 (PTS) 与音频采样时钟对位、固定唇音偏移 (ms)、晶振时钟漂移 (ppm) 引发的随时间线性累积音画跑偏、视频掉帧/重复帧 vs 音频 FIFO 滑移或锁相环 PLL 变调追赶、以及磁带/非编切点瞬态（静音缺口 / 非过零点硬切爆音 / 相位跳变），将摄像、DV、磁带、广电、剪辑、流媒体与音频系统彻底收口为统一整体 | `audio.av_*`, 节点 `av_sync_clock` |

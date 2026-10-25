@@ -43,6 +43,7 @@ from ..codecs.mobile_isp_optics import MobileCameraISPStage
 from ..codecs.legacy_digital_media import FileTransferStage, LCDFlashPlayerStage
 from ..codecs.perception_and_operator import HumanOperatorStage
 from ..codecs.media_ecosystem_evolution import EcosystemSimulatorStage
+from ..codecs.audio import AVSyncClockStage
 from .graph import CATALOG_BY_KIND, Graph, Node
 
 # node kind -> the stage class that implements it (None = handled specially)
@@ -66,6 +67,7 @@ STAGE_FOR_KIND: dict[str, type[Stage] | None] = {
     "display": DisplayStage,
     "offscreen_camera": CRTReshootStage,
     "crt_magnet_env": CRTMagnetEnvStage,
+    "av_sync_clock": AVSyncClockStage,
     "test_generator": TestGeneratorStage,
     "multiview_wall": MultiviewWallStage,
     "ccu_rack": CCURackStage,
@@ -326,6 +328,10 @@ class GraphExecutor:
             np_dict.setdefault("display", {})
             if node_enabled and int(round(float(np_dict["display"].get("crt_magnet_mode", 0.0)))) <= 0:
                 np_dict["display"]["crt_magnet_mode"] = 5.0
+        if kind == "av_sync_clock":
+            np_dict.setdefault("audio", {})
+            if node_enabled and "av_sync_enabled" not in (node_params or {}):
+                np_dict["audio"]["av_sync_enabled"] = 1.0
         return np_dict
 
     def _make_stage_instance(self, kind: str, n_ctx: RenderContext) -> Stage | None:

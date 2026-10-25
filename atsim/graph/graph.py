@@ -482,6 +482,14 @@ CATALOG: tuple[NodeSpec, ...] = (
         params_layer="display",
     ),
     NodeSpec(
+        kind="av_sync_clock", label="音视频同步与时钟系统", group="音频",
+        inputs=(_p("in", "rgb", "视频画面输入"),),
+        outputs=(_p("out", "rgb", "时钟同步画面输出"),),
+        device="10 · 音视频同步与时钟系统 (PTS / 采样率晶振漂移 / 掉帧重发 / 剪辑点瞬态)",
+        note="建模视频 PTS 与音频采样时钟对位、固定唇音偏移 (ms)、晶振时钟漂移 (ppm) 线性累积跑偏、视频掉帧重复帧 vs 音频 FIFO 滑移/PLL 变调以及剪辑点静音/爆音瞬态，串联摄像机、DV、磁带、广电、剪辑、网络流媒体与全部 10 大音频子系统",
+        params_layer="audio",
+    ),
+    NodeSpec(
         kind="node_group", label="节点组", group="节点组",
         inputs=(_p("in", "rgb", "输入"),),
         outputs=(_p("out", "yiq", "输出"),),
@@ -580,7 +588,7 @@ def _ports_compatible(src_node: Node, src_type: str, dst_node: Node, dst_type: s
         return (src_type in _VIDEO_TYPES) and (dst_type in _VIDEO_TYPES)
     if src_node.kind in ("connector", "dist_amp", "patch_router") or dst_node.kind in ("connector", "dist_amp", "patch_router"):
         return (src_type in _VIDEO_TYPES) and (dst_type in _VIDEO_TYPES)
-    if src_node.kind in ("test_generator", "multiview_wall", "ccu_rack", "master_playout", "transfer_station", "linear_editor", "nle_timeline", "automation_controller", "sat_dish_lnb", "sat_ird_receiver", "tv_exciter_pa", "photochemical_film", "film_scanner_telecine", "inversion_analyzer", "archival_vault", "env_chamber", "crt_magnet_env") or dst_node.kind in ("test_generator", "multiview_wall", "ccu_rack", "master_playout", "transfer_station", "linear_editor", "nle_timeline", "automation_controller", "sat_dish_lnb", "sat_ird_receiver", "tv_exciter_pa", "photochemical_film", "film_scanner_telecine", "inversion_analyzer", "archival_vault", "env_chamber", "crt_magnet_env"):
+    if src_node.kind in ("test_generator", "multiview_wall", "ccu_rack", "master_playout", "transfer_station", "linear_editor", "nle_timeline", "automation_controller", "sat_dish_lnb", "sat_ird_receiver", "tv_exciter_pa", "photochemical_film", "film_scanner_telecine", "inversion_analyzer", "archival_vault", "env_chamber", "crt_magnet_env", "av_sync_clock") or dst_node.kind in ("test_generator", "multiview_wall", "ccu_rack", "master_playout", "transfer_station", "linear_editor", "nle_timeline", "automation_controller", "sat_dish_lnb", "sat_ird_receiver", "tv_exciter_pa", "photochemical_film", "film_scanner_telecine", "inversion_analyzer", "archival_vault", "env_chamber", "crt_magnet_env", "av_sync_clock"):
         return (src_type in _VIDEO_TYPES) and (dst_type in _VIDEO_TYPES)
     if src_type in _PICTURE_TYPES and dst_type in _PICTURE_TYPES:
         return True
@@ -2565,5 +2573,46 @@ GRAPH_PRESETS["ldme_bench3_display_devices"] = {
             "enabled": 0.0, "ldme_display_enabled": 1.0, "ldme_display_device": 2.0,
             "ldme_lcd_bits": 6.0, "ldme_lcd_response_ms": 16.0, "ldme_flash_scale_mode": 1.0,
         },
+    },
+}
+
+
+def audio_10_subsystems_av_sync_graph() -> Graph:
+    """10 Audio Subsystems + Unified A/V Clock Synchronization End-to-End Graph."""
+    g = Graph()
+    g.add("src", "source", position=(40, 180))
+    g.add("cam", "mobile_camera_isp", params={"ldme_mobile_enabled": 1.0, "ldme_mobile_profile": 1.0}, position=(220, 180))
+    g.add("av_sync", "av_sync_clock", params={
+        "av_sync_enabled": 1.0,
+        "av_sync_offset_ms": 45.0,
+        "av_clock_drift_ppm": 180.0,
+        "av_frame_drop_rate": 0.04,
+        "av_drop_sync_mode": 0.0,
+        "av_edit_interval_s": 1.2,
+        "av_edit_splice_mode": 2.0,
+    }, position=(430, 180))
+    g.add("disp", "display", position=(650, 180))
+    g.connect("src", "out", "cam", "in")
+    g.connect("cam", "out", "av_sync", "in")
+    g.connect("av_sync", "out", "disp", "in")
+    return g
+
+
+GRAPH_PRESETS["audio_10_subsystems_av_sync_suite"] = {
+    "label": "音频10大子系统与音视频时钟同步全链路台",
+    "note": "覆盖 01 麦克风与录音前端、02 旧手机扬声器与听筒、03 数字采样与格式转换、04 感知音频编码、05 移动电话与网络语音、06 声学空间与麦克风位置、07 播放器与系统音频链、08 铃声/MIDI与移动音源、09 广播与网络平台响度处理、10 音视频同步与时钟系统 (PTS/晶振漂移/掉帧对位/剪辑点瞬态)",
+    "build": audio_10_subsystems_av_sync_graph,
+    "params": {
+        "audio": {
+            "enabled": 1.0,
+            "mic_type": 4.0, "mic_agc_amount": 0.55,
+            "space_preset": 1.0, "space_mic_distance_m": 1.2,
+            "adc_enabled": 1.0, "adc_sample_rate_hz": 22050.0, "adc_bit_depth": 12.0,
+            "pcodec_type": 1.0, "pcodec_bitrate_kbps": 64.0,
+            "sys_audio_preset": 1.0,
+            "loudness_mode": 2.0, "loudness_target_lufs": -14.0,
+            "av_sync_enabled": 1.0, "av_sync_offset_ms": 45.0, "av_clock_drift_ppm": 180.0,
+        },
+        "display": {"enabled": 0.0},
     },
 }

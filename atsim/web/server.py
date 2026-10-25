@@ -1691,22 +1691,12 @@ class App:
                 aud_enabled = float(aud_cfg.get("enabled", 1.0)) > 0.5
                 if aud_enabled:
                     try:
-                        from ..audio.engine import AudioSimulator, encode_wav_pcm16, extract_or_synth_audio
-                        clip_p = store.clip_path(project.source) if project.source else None
                         dur_s = float(total) / max(1.0, float(project.fps))
-                        sr = 44100
-                        pcm_in = extract_or_synth_audio(
-                            clip_p, start_s=0.0, duration_s=dur_s, sr=sr,
-                            synth_type=int(round(float(aud_cfg.get("synth_type", 0.0)))),
-                            seed=project.seed)
-                        asim = AudioSimulator(
-                            std_key=project.standard, fps=project.fps,
-                            params=resolved_p, seed=project.seed, sr=sr)
-                        arun = asim.process(pcm_in, start_s=0.0)
+                        wav_bytes = self.audio_wav(start_s=0.0, duration_s=dur_s, mode="sim", sample_rate=44100)
                         sim_wav_path = self.store.renders / f"{job_id}_audio.wav"
-                        sim_wav_path.write_bytes(encode_wav_pcm16(arun.pcm, sr))
+                        sim_wav_path.write_bytes(wav_bytes)
                         audio_src = str(sim_wav_path)
-                        del pcm_in, arun
+                        del wav_bytes
                         gc.collect()
                     except Exception:
                         if project.source:

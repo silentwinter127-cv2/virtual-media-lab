@@ -25,7 +25,7 @@ LAYER_LABELS = {
     "player": "04 读取解码 (播放设备)",
     "display": "05 显示设备 (CRT)",
     "overlay": "06 字幕机",
-    "audio": "07 音频系统 (模拟/磁带伴音)",
+    "audio": "07 音频系统 (10大声学子系统与音画同步)",
 }
 
 
@@ -2726,12 +2726,14 @@ def build_schema() -> ParamSchema:
     aud.define("enabled", "启用音频模拟", 1.0, 0.0, 1.0, unit="bool", group=g, step=1.0,
                phys_min=0.0, phys_max=1.0, source="系统架构",
                help="开启后，导入素材的原声（或无声素材的内置参考音源）会经过与画面完全同源的模拟/磁带音频链路处理。")
-    aud.define("mode", "伴音轨制式", 0.0, 0.0, 7.0, unit="0-7", group=g, step=1.0,
-               phys_min=0.0, phys_max=7.0,
-               source="IEC 60774 / IEC 61834 / GB 3174 PAL-D/I Intercarrier FM",
+    aud.define("mode", "伴音轨制式", 0.0, 0.0, 15.0, unit="0-15", group=g, step=1.0,
+               phys_min=0.0, phys_max=15.0,
+               source="IEC 60774 / IEC 61834 / GB 3174 / ISO 11172-3 / 3GPP TS 26.071 / ITU-R BS.1770",
                help="0=自动跟随视频制式，1=VHS 纵向线性磁迹，2=VHS Hi-Fi 深层调频立体声，"
                     "3=8mm/Hi8 AFM 调频伴音，4=MiniDV 12-bit PCM 数字伴音，5=VCD MP2 子带量化伴音，"
-                    "6=PAL-D RF 伴音，7=淘宝电视卡 TV-DX 差拍伴音（FM 捕获效应 + QSB 呼吸噪底）。")
+                    "6=PAL-D RF 伴音，7=淘宝电视卡 TV-DX 差拍伴音，8=胶片感光光学声带，9=流媒体低码率伴音，"
+                    "10=广播演播室调音台，11=感知音频编码(MP3/AAC/AMR)，12=移动电话与网络语音(GSM/VoIP)，"
+                    "13=旧手机扬声器与听筒外放，14=早期手机铃声/MIDI与和弦音源，15=电脑播放器与系统音频链。")
     aud.define("synth_type", "无声素材测试音源", 0.0, 0.0, 2.0, unit="0-2", group=g, step=1.0,
                phys_min=0.0, phys_max=2.0, source="内置参考信号发生器",
                help="当使用内置测试图、静帧或无音轨视频时自动生成的测试音源："
@@ -2790,19 +2792,238 @@ def build_schema() -> ParamSchema:
                phys_min=0.0, phys_max=0.50, source="CRT 行逆程变压器声学辐射",
                help="CRT 显像管开启时，15,734Hz (NTSC) / 15,625Hz (PAL) 行扫描高压包磁芯振动串入伴音的微弱高频啸叫。")
 
-    g_mic = "录音设备与麦克风 (Microphone System)"
-    aud.define("mic_type", "麦克风换能类型", 0.0, 0.0, 5.0, unit="类型", group=g_mic, step=1.0,
-               phys_min=0.0, phys_max=5.0, source="电声换能器物理声学模型",
-               help="0=直通/线路输入，1=动圈话筒(SM58高频自然滚降)，2=大振膜电容话筒(全频敏锐)，3=铝带话筒(高频平滑温暖)，4=驻极体电脑摄像头麦克风(优酷女主播同款/3.8kHz塑料腔体共振峰)，5=碳粒话筒(300-3400Hz窄带电报电话话筒)")
+    # --- 01 · 麦克风与录音前端 (Microphone & Preamp Front-End) ---
+    g_mic = "01 · 麦克风与录音前端 (Microphone & Preamp)"
+    aud.define("mic_type", "麦克风换能器型号", 0.0, 0.0, 7.0, unit="0-7", group=g_mic, step=1.0,
+               phys_min=0.0, phys_max=7.0, source="电声换能器与振膜声学阻抗模型",
+               help="0=直通线路输入｜1=动圈话筒(SM58)｜2=大振膜电容话筒(U87)｜3=复古铝带话筒(RCA44)｜"
+                    "4=驻极体电脑摄像头/耳麦话筒(3.8kHz塑料腔体峰)｜5=老式电话碳粒话筒｜"
+                    "6=便携摄像机内置立体声驻极体话筒(带走带电机耦合)｜7=早期手机底部针孔驻极体/MEMS麦克风。")
+    aud.define("mic_polar_pattern", "麦克风指向性图案", 1.0, 0.0, 4.0, unit="0-4", group=g_mic, step=1.0,
+               phys_min=0.0, phys_max=4.0, source="一阶/高阶压力梯度指向性方程 G(θ)=α+(1-α)cos(θ)",
+               help="0=全指向(Omni)｜1=心形指向(Cardioid)｜2=超心形(Supercardioid)｜3=8字双向(Figure-8)｜4=干涉管强指向枪式话筒(Shotgun)。")
+    aud.define("mic_off_axis_deg", "声源偏轴入射角 θ", 0.0, 0.0, 180.0, unit="°", group=g_mic,
+               phys_min=0.0, phys_max=150.0, source="指向性振膜孔径衍射高频滚降模型",
+               help="声源偏离话筒主轴的角度：偏轴不仅按指向性曲线衰减声压，还会因振膜孔径相位抵消导致高频陡峭滚降。")
+    aud.define("mic_sensitivity_db", "换能器灵敏度偏置", 0.0, -24.0, 24.0, unit="dB", group=g_mic,
+               phys_min=-18.0, phys_max=18.0, source="IEC 60268-4 话筒开路灵敏度")
+    aud.define("mic_self_noise", "话筒本底热噪与 JFET 1/f 噪声", 0.0, 0.0, 1.0, unit="0-1", group=g_mic,
+               phys_min=0.0, phys_max=0.80, source="等效输入噪声 (EIN) 与驻极体场效应管闪烁噪声")
+    aud.define("mic_preamp_gain_db", "话放前级增益", 0.0, -18.0, 30.0, unit="dB", group=g_mic,
+               phys_min=-12.0, phys_max=24.0, source="麦克风前置放大器增益级")
+    aud.define("mic_agc_amount", "前端自动增益控制 (AGC) 深度", 0.0, 0.0, 1.0, unit="0-1", group=g_mic,
+               phys_min=0.0, phys_max=0.95, source="摄像机/手机录音前端快启慢释 AGC 抽吸电路",
+               help="在安静间隙自动拉高增益（将房间底噪与走带电机声一并放大），遇到突发大声压时瞬态下压产生呼吸抽吸。")
+    aud.define("mic_agc_speed", "前端 AGC 响应速度", 0.5, 0.0, 1.0, unit="0-1", group=g_mic,
+               phys_min=0.0, phys_max=1.0, source="AGC 检波时间常数 (0=慢速摄像机, 1=快速录音笔/手机)")
+    aud.define("mic_clip_mode", "前级削波失真拓扑", 0.0, 0.0, 2.0, unit="0-2", group=g_mic, step=1.0,
+               phys_min=0.0, phys_max=2.0, source="前级过载削波物理机制",
+               help="0=场效应管/变压器非对称软饱和(Soft Clip)｜1=廉价运放电源轨硬削顶(Hard Rail Clip)｜2=低成本 ADC 整型溢出翻转爆音(Wrap Glitch)。")
     aud.define("proximity_effect", "麦克风近讲效应", 0.0, 0.0, 1.0, unit="0-1", group=g_mic,
                phys_min=0.0, phys_max=1.0, source="近场球面波声压差模型",
-               help="主播贴近定向话筒时 180Hz 以下低频显著提升 (+9dB)。")
+               help="贴近定向话筒时 180Hz 以下低频显著提升 (+9dB)。")
     aud.define("plosive_pop", "防喷罩缺失破音", 0.0, 0.0, 1.0, unit="0-1", group=g_mic,
                phys_min=0.0, phys_max=1.0, source="气流冲击振膜低频风噪模型",
                help="演唱爆破音 (P/B/T) 强气流冲击振膜引起的低频风噪轰鸣与瞬态过载。")
     aud.define("mic_overdrive", "话筒与前级过载削顶", 0.0, 0.0, 1.0, unit="0-1", group=g_mic,
                phys_min=0.0, phys_max=1.0, source="前级放大器轨电压削顶模型",
-               help="唱腔高音或贴近喊叫超出麦克风前级线性动态产生的不对称谐波削顶破音。")
+               help="超出麦克风前级线性动态产生的谐波削顶破音。")
+    aud.define("mic_chassis_vibration", "机身电机与手持震动耦合", 0.0, 0.0, 1.0, unit="0-1", group=g_mic,
+               phys_min=0.0, phys_max=0.90, source="机壳固体声传导：走带电机/变焦马达啸叫与手指摩擦低频轰鸣")
+
+    # --- 02 · 旧手机扬声器与听筒 (Legacy Mobile Speaker & Earpiece) ---
+    g_mspk = "02 · 旧手机扬声器与听筒 (Mobile Speaker & Earpiece)"
+    aud.define("mobile_spk_mode", "手机声学放音终端模式", 0.0, 0.0, 4.0, unit="0-4", group=g_mspk, step=1.0,
+               phys_min=0.0, phys_max=4.0, source="微型受话器与聚酯振膜微扬声器 Thiele-Small 模型",
+               help="0=关闭(全频直出)｜1=手机听筒模式(Earpiece 贴耳受话器 300-3500Hz)｜"
+                    "2=功能机免提外放(Nokia 6600/N73 13×18mm 微型扬声器 f0=780Hz 高通与盆分裂峰)｜"
+                    "3=早期音乐手机/直板机外放(Walkman/iPhone 初代外放 f0=520Hz)｜4=语音信箱与免提座机喇叭。")
+    aud.define("mobile_spk_f0_hz", "微型扬声器低频谐振截止 f0", 680.0, 200.0, 1600.0, unit="Hz", group=g_mspk,
+               phys_min=240.0, phys_max=1200.0, source="微型扬声器顺性与等效振动质量谐振频率 f0")
+    aud.define("mobile_spk_drive", "最大声压级与振膜非线性破音", 0.35, 0.0, 1.0, unit="0-1", group=g_mspk,
+               phys_min=0.0, phys_max=0.95, source="大振幅下音圈磁场 Bl(x) 与折环劲度 Kms(x) 非线性谐波失真")
+    aud.define("mobile_spk_cavity_res", "塑料机壳后腔与出音孔共鸣", 0.45, 0.0, 1.0, unit="0-1", group=g_mspk,
+               phys_min=0.0, phys_max=0.95, source="微型塑料背腔赫姆霍兹谐振与壳体短延迟反射")
+    aud.define("mobile_spk_limiter", "硬件防烧音量限幅器 (ALC)", 0.40, 0.0, 1.0, unit="0-1", group=g_mspk,
+               phys_min=0.0, phys_max=0.95, source="手机功放芯片防过热动态限幅压缩")
+
+    # --- 03 · 数字采样与音频格式转换 (Digital Sampling & Format Conversion) ---
+    g_adc = "03 · 数字采样与音频格式转换 (Digital Sampling & SRC)"
+    aud.define("adc_enabled", "启用数字采样与格式转换器", 0.0, 0.0, 1.0, unit="bool", group=g_adc, step=1.0,
+               phys_min=0.0, phys_max=1.0, source="PCM 模数采样定理与定点量化误差模型")
+    aud.define("adc_sample_rate_hz", "数字目标采样率 fs", 44100.0, 4000.0, 48000.0, unit="Hz", group=g_adc,
+               phys_min=6000.0, phys_max=48000.0, source="常见数字采样率 (8kHz语音 / 11.025kHz多媒体 / 22.05kHz Flash / 32kHz DV / 44.1kHz CD)")
+    aud.define("adc_bit_depth", "量化位深 (Bit Depth)", 16.0, 4.0, 24.0, unit="bit", group=g_adc, step=1.0,
+               phys_min=6.0, phys_max=24.0, source="均匀 PCM 定点量化阶数 2^B")
+    aud.define("adc_resample_filter", "重采样抗混叠与插值滤波器", 0.0, 0.0, 2.0, unit="0-2", group=g_adc, step=1.0,
+               phys_min=0.0, phys_max=2.0, source="数字抽取与内插重构核",
+               help="0=Sinc 理想抗混叠滤波｜1=线性插值(Linear SRC 高频滚降与部分折叠混叠)｜2=零阶保持阶梯采样(Zero-Order Hold 无抗混叠强烈镜像金属混叠)。")
+    aud.define("adc_dither_mode", "量化抖动与噪声整形 (Dither)", 0.0, 0.0, 3.0, unit="0-3", group=g_adc, step=1.0,
+               phys_min=0.0, phys_max=3.0, source="Lipshitz & Vanderkooy 量化抖动理论",
+               help="0=无抖动硬截断(产生相关奇次谐波与尾音门限截断)｜1=矩形分布 RPDF｜2=三角分布 TPDF(消除非线性失真转为平稳白噪底)｜3=一阶高频噪声整形 TPDF。")
+    aud.define("adc_channel_mode", "声道混合与相位故障", 0.0, 0.0, 3.0, unit="0-3", group=g_adc, step=1.0,
+               phys_min=0.0, phys_max=3.0, source="立体声下混与转接头反相抵消模型",
+               help="0=保持立体声｜1=单声道相加 (L+R)/2｜2=反相相消梳状下混 (L-0.85R 典型转接线虚焊中置人声消失)｜3=仅左声道复制。")
+    aud.define("adc_clip_level", "ADC 满刻度削波上限", 1.0, 0.20, 1.0, unit="FS", group=g_adc,
+               phys_min=0.35, phys_max=1.0, source="A/D 转换器参考电压上限")
+    aud.define("adc_clock_jitter", "采样时钟孔径抖动 (Jitter)", 0.0, 0.0, 1.0, unit="0-1", group=g_adc,
+               phys_min=0.0, phys_max=0.80, source="采样时钟相位噪声 Δt(n)·dx/dt")
+    aud.define("adc_clock_drift_ppm", "重采样时钟频偏 (Drift)", 0.0, -2000.0, 2000.0, unit="ppm", group=g_adc,
+               phys_min=-1000.0, phys_max=1000.0, source="独立晶振频率公差 (ppm)")
+
+    # --- 04 · 感知音频编码 (Perceptual Audio Coding: MP3 / AAC / AMR / Speech) ---
+    g_pcodec = "04 · 感知音频编码 (Perceptual Audio Codecs)"
+    aud.define("pcodec_type", "感知音频编码器类型", 0.0, 0.0, 4.0, unit="0-4", group=g_pcodec, step=1.0,
+               phys_min=0.0, phys_max=4.0, source="ISO/IEC 11172-3 (MP3) / 14496-3 (AAC) / 3GPP TS 26.071 (AMR-NB)",
+               help="0=关闭｜1=MP3 (32子带+MDCT混合滤波组，低码率预回声与水声Birdies明显)｜"
+                    "2=AAC-LC / HE-AAC (含低码率SBR高频频带复制金属光泽)｜"
+                    "3=AMR-NB (3GPP 4.75-12.2kbps 手机3GP代数码本激励线性预测语音编码)｜"
+                    "4=极低码率语音编码 (RealAudio G2 / CELP 8-24kbps)。")
+    aud.define("pcodec_bitrate_kbps", "感知编码目标码率", 64.0, 4.75, 320.0, unit="kbps", group=g_pcodec,
+               phys_min=4.75, phys_max=320.0, source="编码器比特池分配速率 (相同码率下不同编码器的心理声学掩蔽损伤截然不同)")
+    aud.define("pcodec_pre_echo", "瞬态涂抹与预回声 (Pre-Echo)", 0.35, 0.0, 1.0, unit="0-1", group=g_pcodec,
+               phys_min=0.0, phys_max=0.95, source="长窗 MDCT 块内量化噪声向打击乐瞬态前方扩散效应")
+    aud.define("pcodec_birdies", "频带空洞与水声伪影 (Birdies)", 0.40, 0.0, 1.0, unit="0-1", group=g_pcodec,
+               phys_min=0.0, phys_max=0.95, source="Bark 临界频带比特饥饿引发的谱线时变闪烁杂音")
+    aud.define("pcodec_generations", "多代重复有损重编码次数", 1.0, 1.0, 8.0, unit="代", group=g_pcodec, step=1.0,
+               phys_min=1.0, phys_max=6.0, source="跨平台多次下载重传引起的级联 MDCT 帧移位与频带塌陷")
+
+    # --- 05 · 移动电话与网络语音 (Mobile Telephony & VoIP Speech) ---
+    g_tel = "05 · 移动电话与网络语音 (Mobile & VoIP Speech)"
+    aud.define("telecom_mode", "实时语音通信链路模式", 0.0, 0.0, 3.0, unit="0-3", group=g_tel, step=1.0,
+               phys_min=0.0, phys_max=3.0, source="GSM 06.10 / 3GPP AMR / ITU-T G.711 & G.722 / WebRTC",
+               help="0=关闭｜1=2G GSM/AMR 移动蜂窝通话 (含 217Hz TDMA 射频突发蜂音与 DTX 舒适噪声)｜"
+                    "2=早期网络语音 (Skype / QQ语音：谱减法降噪音乐噪声 + 回声消除残差 + 抖动缓冲变速)｜"
+                    "3=弱信号基站边缘/高丢包会议语音 (连续丢包 PLC 机械电音冻结 + VAD 吞字)。")
+    aud.define("telecom_wideband", "语音带宽制式 (0窄带/1宽带)", 0.0, 0.0, 1.0, unit="0-1", group=g_tel, step=1.0,
+               phys_min=0.0, phys_max=1.0, source="0=ITU-T G.712 窄带电话 (300-3400Hz)，1=G.722/AMR-WB 高清宽带语音 (50-7000Hz)")
+    aud.define("telecom_vad_threshold", "语音活动检测 (VAD) 静音门限", 0.25, 0.0, 1.0, unit="0-1", group=g_tel,
+               phys_min=0.0, phys_max=0.85, source="DTX 不连续传输静音抑制门限（过高会吞掉字头与尾音）")
+    aud.define("telecom_cng_level", "舒适噪声生成 (CNG) 电平", 0.20, 0.0, 1.0, unit="0-1", group=g_tel,
+               phys_min=0.0, phys_max=0.80, source="RFC 3389 / GSM 06.12 静音期背景合成舒适噪声")
+    aud.define("telecom_packet_loss_pct", "RTP/无线帧丢包率", 0.0, 0.0, 60.0, unit="%", group=g_tel,
+               phys_min=0.0, phys_max=45.0, source="Gilbert-Elliott 突发信道丢包模型")
+    aud.define("telecom_plc_mode", "丢包隐藏算法 (PLC)", 1.0, 0.0, 1.0, unit="0-1", group=g_tel, step=1.0,
+               phys_min=0.0, phys_max=1.0, source="0=零填充静音断续，1=ITU G.711 App.I 基音周期波形重复隐藏(连续丢包呈机械电音)")
+    aud.define("telecom_aec_residue", "声学回声消除 (AEC) 残差与双讲压制", 0.0, 0.0, 1.0, unit="0-1", group=g_tel,
+               phys_min=0.0, phys_max=0.90, source="自适应滤波器非线性残余回声中心削波与双讲抽吸")
+    aud.define("telecom_ns_strength", "谱减法背景降噪 (NS) 强度", 0.0, 0.0, 1.0, unit="0-1", group=g_tel,
+               phys_min=0.0, phys_max=0.95, source="Boll 谱减法过减因子引入的孤立谱峰『音乐噪声』(Musical Noise)")
+    aud.define("telecom_jitter_ms", "网络自适应抖动缓冲变速深度", 0.0, 0.0, 150.0, unit="ms", group=g_tel,
+               phys_min=0.0, phys_max=120.0, source="NetEQ 自适应抖动缓冲时间伸缩调整")
+    aud.define("telecom_latency_ms", "单向传输与编解码延迟", 0.0, 0.0, 600.0, unit="ms", group=g_tel,
+               phys_min=0.0, phys_max=500.0, source="端到端语音分组排队与交织延迟")
+
+    # --- 06 · 声学空间与麦克风位置 (Acoustic Space & Microphone Placement) ---
+    g_spc = "06 · 声学空间与麦克风位置 (Acoustic Space & Placement)"
+    aud.define("space_preset", "物理声学空间环境预设", 0.0, 0.0, 4.0, unit="0-4", group=g_spc, step=1.0,
+               phys_min=0.0, phys_max=4.0, source="三维矩形房间简正驻波模态 + 镜像源早期反射 + Sabine 混响模型",
+               help="0=消声直通｜1=主播卧室/书桌近讲(3.4×2.8×2.6m 强桌面反射与低频驻波+机箱风扇)｜"
+                    "2=瓷砖走廊/楼梯间(12.5×1.7×3.0m 平行硬墙颤动回声 Flutter Echo + 长混响)｜"
+                    "3=大学教室/阶梯讲堂(9.6×7.2×3.4m 远距拾音多抽头反射+空调底噪)｜"
+                    "4=室外街道/露天场地(无房间驻波、地面与远处楼体单次反射、空气高频吸收与风噪车流)。")
+    aud.define("space_room_length_m", "房间长度 Lx", 4.2, 1.2, 40.0, unit="m", group=g_spc,
+               phys_min=1.5, phys_max=30.0, source="空间纵向几何尺寸 (决定轴向简正模态 f=c/2Lx)")
+    aud.define("space_room_width_m", "房间宽度 Ly", 3.4, 1.0, 40.0, unit="m", group=g_spc,
+               phys_min=1.2, phys_max=30.0, source="空间横向几何尺寸 (决定侧墙早期反射与颤动回声周期)")
+    aud.define("space_room_height_m", "房间高度 Lz", 2.7, 1.8, 20.0, unit="m", group=g_spc,
+               phys_min=2.0, phys_max=15.0, source="空间垂直几何尺寸")
+    aud.define("space_rt60_s", "混响时间 RT60 (-1自动跟随预设)", -1.0, -1.0, 4.0, unit="s", group=g_spc,
+               phys_min=-1.0, phys_max=3.5, source="Sabine / Eyring 室内声能衰减 60dB 时间")
+    aud.define("space_wall_absorption", "墙面高频吸声系数 (-1自动)", -1.0, -1.0, 0.98, unit="α", group=g_spc,
+               phys_min=-1.0, phys_max=0.95, source="建筑材料吸声率 (0.1=釉面瓷砖/水泥, 0.5=石膏板/窗帘, 0.9=声学海绵)")
+    aud.define("space_standing_waves", "房间低频简正驻波共振 (-1自动)", -1.0, -1.0, 1.0, unit="0-1", group=g_spc,
+               phys_min=-1.0, phys_max=0.95, source="Schroeder 频率以下三维轴向驻波共振峰 (决非简单低频 EQ)")
+    aud.define("space_mic_distance_m", "声源至麦克风距离 (-1自动)", -1.0, -1.0, 12.0, unit="m", group=g_spc,
+               phys_min=-1.0, phys_max=10.0, source="临界距离直达声/混响声比 (DRR) 与 ISO 9613 大气高频吸收")
+    aud.define("space_occlusion", "物理遮挡与口袋/手掌闷音", 0.0, 0.0, 1.0, unit="0-1", group=g_spc,
+               phys_min=0.0, phys_max=0.95, source="手指按住麦克风孔、手机揣入口袋或隔门拾音的绕射低通与腔体闷响")
+    aud.define("space_ambient_noise", "环境特征背景噪声电平", 0.0, 0.0, 1.0, unit="0-1", group=g_spc,
+               phys_min=0.0, phys_max=0.90, source="按空间类型合成真实环境声床 (卧室机箱风扇/走廊镇流器/教室空调低语/室外阵风车流)")
+
+    # --- 07 · 播放器与系统音频链 (Media Player & OS System Audio Chain) ---
+    g_sys = "07 · 播放器与系统音频链 (Player & OS Audio Chain)"
+    aud.define("sys_audio_preset", "播放终端与系统混音链预设", 0.0, 0.0, 4.0, unit="0-4", group=g_sys, step=1.0,
+               phys_min=0.0, phys_max=4.0, source="Windows KMixer / AC'97 / Flash SoundMixer / 桌面有源音箱实测模型",
+               help="0=直通无损｜1=Windows 98/XP KMixer + AC'97 板载声卡(44.1→48kHz线性重采样与总线底噪)｜"
+                    "2=浏览器 Flash Player 网页视频音频链(22.05kHz重采样+环形缓冲欠载卡顿)｜"
+                    "3=千禧年百元桌面 2.0 多媒体塑料有源音箱(145Hz倒相管轰鸣+SRS 3D扩展)｜"
+                    "4=接触不良 3.5mm 耳机孔/外接转接线(共地阻抗串扰导致人声中置抵消与切口爆音)。")
+    aud.define("sys_mixer_gain", "系统混音器音量增益", 1.0, 0.0, 2.5, unit="×", group=g_sys,
+               phys_min=0.1, phys_max=2.0, source="操作系统主混音器数字增益")
+    aud.define("sys_src_mode", "系统/浏览器重采样器模式", 0.0, 0.0, 2.0, unit="0-2", group=g_sys, step=1.0,
+               phys_min=0.0, phys_max=2.0, source="0=无损直通，1=WinXP KMixer 44.1→48kHz 线性插值，2=Flash Player 22.05kHz 快速抽取")
+    aud.define("sys_channel_map", "输出声道映射与接线状态", 0.0, 0.0, 3.0, unit="0-3", group=g_sys, step=1.0,
+               phys_min=0.0, phys_max=3.0, source="0=正常立体声，1=左右声道反接，2=3.5mm 地线虚焊(L-R差模去人声)，3=单声道左路")
+    aud.define("sys_eq_preset", "播放器均衡器与低音增强预设", 0.0, 0.0, 3.0, unit="0-3", group=g_sys, step=1.0,
+               phys_min=0.0, phys_max=3.0, source="0=平直，1=摇滚 V 型微笑曲线，2=流行人声突出，3=Mega Bass 桌面箱低音增强")
+    aud.define("sys_spatial_3d", "3D 环绕立体声扩展与激励 (SRS/BBE)", 0.0, 0.0, 1.0, unit="0-1", group=g_sys,
+               phys_min=0.0, phys_max=0.95, source="差模侧向信号加宽与哈斯效应延迟激励")
+    aud.define("sys_buffer_underrun", "音频环形缓冲区欠载卡顿率", 0.0, 0.0, 1.0, unit="0-1", group=g_sys,
+               phys_min=0.0, phys_max=0.85, source="DMA / 浏览器音频线程阻塞导致 32ms 缓冲片重复卡碟颤音")
+    aud.define("sys_device_switch_pop", "输出设备热切换瞬态冲击", 0.0, 0.0, 1.0, unit="0-1", group=g_sys,
+               phys_min=0.0, phys_max=0.90, source="声卡隔直电容充放电冲击与继电器切换静音间隙")
+    aud.define("sys_mixer_clip", "系统混音器定点溢出硬削波", 0.0, 0.0, 1.0, unit="0-1", group=g_sys,
+               phys_min=0.0, phys_max=0.90, source="16-bit 混音母线无动态余量饱和削顶")
+
+    # --- 08 · 铃声、MIDI 与移动音源 (Ringtones, MIDI & Mobile Sound Engines) ---
+    g_ring = "08 · 铃声、MIDI 与移动音源 (Ringtones & Mobile Synth)"
+    aud.define("ringtone_mode", "移动合成音源与铃声引擎", 0.0, 0.0, 4.0, unit="0-4", group=g_ring, step=1.0,
+               phys_min=0.0, phys_max=4.0, source="Nokia RTTTL 压电蜂鸣器 / Yamaha MA-2 & MA-3 FM 芯片 / 早期低位深波表合成",
+               help="0=关闭(使用正常伴音)｜1=单音压电蜂鸣器(Nokia RTTTL 纯方波单声部经典铃声)｜"
+                    "2=4/16和弦 FM 手机合成芯片(Yamaha MA-2/MA-3 正弦查找表调制与阶梯包络)｜"
+                    "3=早期低位深 PCM 波表 MIDI 音源(8-bit/12-bit 循环采样 SoundFont)｜"
+                    "4=输入伴音实时转译为手机和弦/单音铃声(实时追踪主频峰并按最大复音数抢占发声)。")
+    aud.define("ringtone_polyphony", "最大同时发声复音数 (Polyphony)", 4.0, 1.0, 64.0, unit="声部", group=g_ring, step=1.0,
+               phys_min=1.0, phys_max=64.0, source="硬件通道上限 (1=单音蜂鸣器, 4=早期4和弦, 16=16和弦, 64=64和弦；超限触发旧音截断 Voice Stealing)")
+    aud.define("ringtone_tick_quant_ms", "音序器时基 Tick 量化网格", 25.0, 0.0, 150.0, unit="ms", group=g_ring,
+               phys_min=0.0, phys_max=120.0, source="MIDI / RTTTL 硬件定时器中断粒度")
+    aud.define("ringtone_env_steps", "硬件音量包络寄存器阶数", 16.0, 2.0, 128.0, unit="阶", group=g_ring, step=1.0,
+               phys_min=4.0, phys_max=128.0, source="音源芯片包络发生器离散衰减步进 (低阶数产生特征性拉链噪声)")
+    aud.define("ringtone_wavetable_bits", "音源查找表/波表位深", 8.0, 4.0, 16.0, unit="bit", group=g_ring, step=1.0,
+               phys_min=4.0, phys_max=16.0, source="FM 正弦表或 PCM 波表 ROM 采样位宽")
+    aud.define("ringtone_mix", "铃声/MIDI 音源混合比", 1.0, 0.0, 1.0, unit="0-1", group=g_ring,
+               phys_min=0.0, phys_max=1.0, source="合成音源与原始伴音的干湿混合度")
+
+    # --- 09 · 广播与网络平台的响度处理 (Broadcast & Platform Loudness / EBU R 128) ---
+    g_loud = "09 · 广播与网络平台的响度处理 (Loudness & EBU R 128)"
+    aud.define("loudness_mode", "响度标准化与动态压限模式", 0.0, 0.0, 4.0, unit="0-4", group=g_loud, step=1.0,
+               phys_min=0.0, phys_max=4.0, source="ITU-R BS.1770-4 / EBU R 128 / ATSC A/85 / 流媒体平台响度规范",
+               help="0=仅开启 K 加权 LUFS 与真峰值测量表(不改变音频)｜"
+                    "1=EBU R 128 广播标准响度归一化(-23.0 LUFS, -1.0 dBTP 真峰值限幅)｜"
+                    "2=FM 电台/电视商业广告『响度战争』多段压限器(Orban Optimod 风格 -9.5 LUFS 高密度抽吸轰炸)｜"
+                    "3=网络视频平台响度归一化(YouTube/B站 -14.0 LUFS 自动增益惩罚与真峰值削顶)｜"
+                    "4=跨平台多次搬运重转码响度漂移与动态塌陷。")
+    aud.define("loudness_target_lufs", "目标综合响度 (Integrated LUFS)", -14.0, -32.0, -5.0, unit="LUFS", group=g_loud,
+               phys_min=-28.0, phys_max=-6.0, source="ITU-R BS.1770-4 K-加权门限综合响度目标值")
+    aud.define("loudness_compressor", "广播多段压缩与响度激励深度", 0.0, 0.0, 1.0, unit="0-1", group=g_loud,
+               phys_min=0.0, phys_max=0.95, source="三频段分频动态压缩与自动增益补偿 (减小 LRA 响度范围)")
+    aud.define("loudness_true_peak_dbtp", "真峰值砖墙限幅上限 (True Peak)", -1.0, -9.0, 0.0, unit="dBTP", group=g_loud,
+               phys_min=-6.0, phys_max=0.0, source="4倍过采样采样间真峰值 (Inter-sample True Peak) 上限")
+    aud.define("loudness_retranscode_passes", "平台级联归一化重转码轮数", 1.0, 1.0, 6.0, unit="轮", group=g_loud, step=1.0,
+               phys_min=1.0, phys_max=6.0, source="不同平台目标响度不一致引发的多代动态挤压")
+
+    # --- 10 · 音视频同步与时钟系统 (Audio-Video Sync & Master Clock System) ---
+    g_avsync = "10 · 音视频同步与时钟系统 (A/V Sync & Clock System)"
+    aud.define("av_sync_enabled", "启用音视频同步与主时钟系统", 0.0, 0.0, 1.0, unit="bool", group=g_avsync, step=1.0,
+               phys_min=0.0, phys_max=1.0, source="MPEG PTS/DTS 时间戳、声卡/采集卡独立晶振与主控同步模型",
+               help="打通摄像机、DV、磁带走带、线性/非线性编辑、广播播出与网络流媒体的统一音画时钟耦合系统。")
+    aud.define("av_sync_offset_ms", "固定音画唇音同步偏移 (Lip-Sync Offset)", 0.0, -1000.0, 1000.0, unit="ms", group=g_avsync,
+               phys_min=-500.0, phys_max=500.0, source="ITU-R BT.1359 音画同步感知容限 (+值表示声音滞后于画面，-值表示声音超前)")
+    aud.define("av_clock_drift_ppm", "音视频独立晶振时钟漂移 (Clock Drift)", 0.0, -5000.0, 5000.0, unit="ppm", group=g_avsync,
+               phys_min=-2000.0, phys_max=2000.0, source="音频采样时钟与视频帧率时钟未锁相 (Non-Genlocked) 导致的随时间线性累积滑移")
+    aud.define("av_frame_drop_rate", "视频掉帧/重复帧概率", 0.0, 0.0, 0.90, unit="0-1", group=g_avsync,
+               phys_min=0.0, phys_max=0.75, source="USB 摄像头带宽瓶颈、早期 NLE 预览掉帧或流媒体卡顿引发的画面停顿")
+    aud.define("av_drop_sync_mode", "视频掉帧时伴音同步策略", 0.0, 0.0, 2.0, unit="0-2", group=g_avsync, step=1.0,
+               phys_min=0.0, phys_max=2.0, source="音视频缓冲区追赶与重同步机制",
+               help="0=时钟解耦自由滑移(画面卡住但声音继续播放，导致后续音画错位累积)｜"
+                    "1=硬锁帧 FIFO 滑移(视频掉帧时伴音同步重复/丢弃对应帧切片，产生跳帧咔哒声但保持同步)｜"
+                    "2=PLL 锁相环平滑变调重采样(动态微调音频速度追赶视频 PTS)。")
+    aud.define("av_edit_splice_mode", "编辑切点伴音拼接瞬态", 0.0, 0.0, 2.0, unit="0-2", group=g_avsync, step=1.0,
+               phys_min=0.0, phys_max=2.0, source="磁带组合/插入编辑与早期非线编切点声学瞬态",
+               help="0=无缝拼接｜1=非过零硬切口(4ms 控制轨断流静音间隙 + 偏磁阶跃咔哒声与相位跳变)｜2=NLE 5ms V型交叉淡化凹陷。")
+    aud.define("av_edit_interval_s", "周期性编辑切点间隔", 1.5, 0.25, 10.0, unit="s", group=g_avsync,
+               phys_min=0.5, phys_max=10.0, source="时间线分镜头切换周期")
 
     g_bcast = "广播音响与调音台 (Broadcast Console)"
     aud.define("broadcast_agc", "广播级AGC限幅压缩器", 0.0, 0.0, 1.0, unit="0-1", group=g_bcast,
@@ -4042,6 +4263,113 @@ DIGITAL_PROFILES = {
     },
 }
 
+AUDIO_PROFILES = {
+    "audio_01_webcam_electret_agc_clip": {
+        "label": "01 · 电脑摄像头驻极体话筒 + 前端 AGC 抽吸与运放硬削顶",
+        "note": "还原千禧年 PC 摄像头/耳麦近讲拾音：切除 215Hz 以下低频、3.8kHz 塑料腔体尖峰、安静间隙 AGC 自动拉起风扇底噪与高声压运放轨硬削波",
+        "layers": {
+            "audio": {
+                "enabled": 1.0, "mic_type": 4.0, "mic_polar_pattern": 1.0, "proximity_effect": 0.55,
+                "plosive_pop": 0.48, "mic_agc_amount": 0.72, "mic_clip_mode": 1.0, "mic_overdrive": 0.62,
+                "mic_self_noise": 0.28,
+            },
+        },
+    },
+    "audio_02_nokia_handsfree_micro_speaker": {
+        "label": "02 · 旧功能机免提微型扬声器外放 (Nokia 6600/N73 破音腔体)",
+        "note": "13×18mm 聚酯振膜微扬声器：f0=780Hz 高通切除低音、2.45kHz/3.85kHz 盆分裂与塑料背腔共鸣、大音量折环非线性破音与防烧 ALC 限幅",
+        "layers": {
+            "audio": {
+                "enabled": 1.0, "mode": 13.0, "mobile_spk_mode": 2.0, "mobile_spk_f0_hz": 780.0,
+                "mobile_spk_drive": 0.68, "mobile_spk_cavity_res": 0.75, "mobile_spk_limiter": 0.60,
+            },
+        },
+    },
+    "audio_03_8bit_11khz_zoh_sampler": {
+        "label": "03 · 早期 8-bit / 11.025kHz 零阶保持数字采样与反相梳状下混",
+        "note": "无抗混叠零阶保持阶梯重采样 (ZOH) 叠加 8-bit 无抖动截断量化与转接头反相声道抵消",
+        "layers": {
+            "audio": {
+                "enabled": 1.0, "adc_enabled": 1.0, "adc_sample_rate_hz": 11025.0, "adc_bit_depth": 8.0,
+                "adc_resample_filter": 2.0, "adc_dither_mode": 0.0, "adc_clock_jitter": 0.25,
+            },
+        },
+    },
+    "audio_04_mp3_32kbps_multigen_birdies": {
+        "label": "04 · 32kbps MP3 心理声学编码水声 (Birdies) 与预回声 (3代重压)",
+        "note": "Bark 临界频带比特饥饿导致未掩蔽子带成片归零（频带空洞闪烁水声）与打击乐长窗 MDCT 预回声",
+        "layers": {
+            "audio": {
+                "enabled": 1.0, "mode": 11.0, "pcodec_type": 1.0, "pcodec_bitrate_kbps": 32.0,
+                "pcodec_pre_echo": 0.72, "pcodec_birdies": 0.78, "pcodec_generations": 3.0,
+            },
+        },
+    },
+    "audio_05_gsm_voip_packet_loss_plc": {
+        "label": "05 · 移动蜂窝/早期网络语音 (VAD 吞字 + CNG 舒适噪声 + 丢包 PLC 电音)",
+        "note": "300-3400Hz 窄带语音、DTX 静音抑制切掉尾音并填入合成舒适噪声、谱减法音乐噪声及突发丢包基音重复机械声",
+        "layers": {
+            "audio": {
+                "enabled": 1.0, "mode": 12.0, "telecom_mode": 3.0, "telecom_wideband": 0.0,
+                "telecom_vad_threshold": 0.38, "telecom_cng_level": 0.30, "telecom_packet_loss_pct": 16.0,
+                "telecom_plc_mode": 1.0, "telecom_aec_residue": 0.35, "telecom_ns_strength": 0.55,
+                "telecom_jitter_ms": 38.0,
+            },
+        },
+    },
+    "audio_06_tiled_corridor_flutter_echo": {
+        "label": "06 · 瓷砖走廊与楼梯间声学空间 (平行墙颤动回声 + 轴向驻波 + 口袋遮挡)",
+        "note": "12.5×1.7×3.0m 狭长硬质瓷砖走廊：9.9ms 周期性平行墙颤动回声、1.35s 长混响、低频简正模态与远距离拾音",
+        "layers": {
+            "audio": {
+                "enabled": 1.0, "space_preset": 2.0, "space_rt60_s": 1.35, "space_wall_absorption": 0.12,
+                "space_standing_waves": 0.68, "space_mic_distance_m": 2.2, "space_ambient_noise": 0.25,
+            },
+        },
+    },
+    "audio_07_winxp_kmixer_flash_underrun": {
+        "label": "07 · WinXP KMixer + 浏览器 Flash 播放器音频链 (缓冲欠载卡碟 + 3.5mm 虚焊)",
+        "note": "模拟早期电脑看视频：Flash 22.05kHz 重采样、CPU 卡顿引发 32ms 环形缓冲重复颤音、Mega Bass 音箱共鸣与混音器硬削波",
+        "layers": {
+            "audio": {
+                "enabled": 1.0, "mode": 15.0, "sys_audio_preset": 2.0, "sys_src_mode": 2.0,
+                "sys_eq_preset": 3.0, "sys_spatial_3d": 0.45, "sys_buffer_underrun": 0.35, "sys_mixer_clip": 0.35,
+            },
+        },
+    },
+    "audio_08_nokia_rtttl_and_4chord_fm": {
+        "label": "08 · 诺基亚单音蜂鸣器 (RTTTL) 与 Yamaha 4和弦 FM 手机音源",
+        "note": "严格 1 声部压电陶瓷方波蜂鸣器或 4 声部 FM 合成器：硬件声部抢占截断 (Voice Stealing)、25ms Tick 量化与 16 阶包络步进",
+        "layers": {
+            "audio": {
+                "enabled": 1.0, "mode": 14.0, "ringtone_mode": 1.0, "ringtone_polyphony": 1.0,
+                "ringtone_tick_quant_ms": 28.0, "ringtone_env_steps": 12.0, "ringtone_mix": 1.0,
+            },
+        },
+    },
+    "audio_09_broadcast_loudness_war_optimod": {
+        "label": "09 · 电视广告『响度战争』多段压限 (-9.5 LUFS) vs 平台 -14 LUFS 归一化",
+        "note": "ITU-R BS.1770 K-加权响度测量、三频段高密度广播多段压缩与 -0.3 dBTP 真峰值砖墙限幅",
+        "layers": {
+            "audio": {
+                "enabled": 1.0, "loudness_mode": 2.0, "loudness_target_lufs": -9.5,
+                "loudness_compressor": 0.82, "loudness_true_peak_dbtp": -0.3,
+            },
+        },
+    },
+    "audio_10_av_clock_drift_and_splice_sync": {
+        "label": "10 · 音视频时钟漂移 (ppm)、掉帧 FIFO 追赶与磁带切点瞬态同步",
+        "note": "模拟声卡与采集卡未锁相引起的线性累积唇音失步、视频掉帧时伴音 FIFO 重复切片以及非过零硬切口咔哒声",
+        "layers": {
+            "audio": {
+                "enabled": 1.0, "av_sync_enabled": 1.0, "av_sync_offset_ms": 85.0,
+                "av_clock_drift_ppm": 650.0, "av_frame_drop_rate": 0.18, "av_drop_sync_mode": 1.0,
+                "av_edit_splice_mode": 1.0, "av_edit_interval_s": 1.2,
+            },
+        },
+    },
+}
+
 PROFILE_LIBRARY = {
     "digital": DIGITAL_PROFILES,
     "film": FILM_PROFILES,
@@ -4049,6 +4377,7 @@ PROFILE_LIBRARY = {
     "player": PLAYER_PROFILES,
     "display": DISPLAY_PROFILES,
     "camera": CAMERA_PROFILES,
+    "audio": AUDIO_PROFILES,
 }
 
 # NOTE on `rf.broadcast_noise` absolute level:
@@ -6747,3 +7076,10 @@ FACTORY_PRESETS["digicam_y2k_ccd_sensor"] = {
         **DISPLAY_PROFILES["lcd_desktop_2007_tn"]["layers"],
     },
 }
+
+for _aud_k, _aud_spec in AUDIO_PROFILES.items():
+    FACTORY_PRESETS[_aud_k] = {
+        "label": _aud_spec["label"],
+        "note": _aud_spec["note"],
+        "layers": _aud_spec["layers"],
+    }

@@ -989,14 +989,138 @@ const SELECTORS = {
     [8, "8 · 胶片感光光学音轨 (Optical Soundtrack)"],
     [9, "9 · 网络流媒体低码率音频 (优酷/土豆/3GP)"],
     [10, "10 · 广播电台/演播室播出前级系统"],
+    [11, "11 · 旧手机免提外放与听筒 (Mobile Speaker/Earpiece)"],
+    [12, "12 · 移动电话与 VoIP 网络语音 (GSM/AMR/窄带电话)"],
+    [13, "13 · 铃声、MIDI 与和弦音源 (Nokia蜂鸣器/Yamaha FM)"],
+    [14, "14 · 早期廉价录音笔 / MP3 随身听 ADPCM 内录"],
+    [15, "15 · 10 大音频子系统自由组合工作台"],
   ],
   "audio.mic_type": [
     [0, "0 · 直通 / 线路输入 (Direct Line In)"],
     [1, "1 · 动圈话筒 (Shure SM58 风格)"],
     [2, "2 · 大振膜电容话筒 (演播室高灵敏度)"],
     [3, "3 · 铝带话筒 (温暖平滑 8 字指向)"],
-    [4, "4 · 驻极体电脑摄像头麦克风 (优酷女主播同款)"],
-    [5, "5 · 碳粒话筒 (老式电话/对讲窄频)"],
+    [4, "4 · 驻极体电脑摄像头麦克风 (桌面散装麦克风)"],
+    [5, "5 · 碳粒话筒 (老式座机电话/对讲窄频)"],
+    [6, "6 · 家用 DV 机顶立体声驻极体麦 (风噪/走带电机耦合)"],
+    [7, "7 · 早期直板功能机针孔驻极体/MEMS 麦 (强AGC/极易爆音)"],
+  ],
+  "audio.mic_polar_pattern": [
+    [0, "0 · 全指向 (Omnidirectional)"],
+    [1, "1 · 心形指向 (Cardioid)"],
+    [2, "2 · 超心形指向 (Supercardioid)"],
+    [3, "3 · 8字双指向 (Figure-8)"],
+    [4, "4 · 强指向枪式话筒 (Shotgun 干涉管)"],
+  ],
+  "audio.mic_clip_mode": [
+    [0, "0 · 模拟运放软削波 (Soft Op-Amp Saturation)"],
+    [1, "1 · 廉价声卡/手机 ADC 硬削波 (Hard Brickwall Clip)"],
+    [2, "2 · 定点寄存器溢出折返爆音 (Integer Wrap-Around)"],
+  ],
+  "audio.mobile_spk_mode": [
+    [0, "0 · 关闭"],
+    [1, "1 · 电话听筒模式 (贴耳密闭受话器 300-3400Hz)"],
+    [2, "2 · 功能机背面免提单声道外放 (Nokia/山寨机大嗓门薄亮刺耳)"],
+    [3, "3 · 早期智能手机微型扬声器外放 (iPhone 3G/4 微型腔体)"],
+    [4, "4 · 对讲机 / 语音信箱免提公放 (强中频共振)"],
+  ],
+  "audio.adc_resample_filter": [
+    [0, "0 · 标准抗混叠 Sinc 低通重采样"],
+    [1, "1 · 早期声卡线性插值重采样 (高频暗淡+镜像残留)"],
+    [2, "2 · 无抗混叠零阶保持抽取 (Zero-Order Hold 金属折返混叠)"],
+  ],
+  "audio.adc_dither_mode": [
+    [0, "0 · 无抖动直接截断 (Truncation 谐波颗粒失真)"],
+    [1, "1 · 矩形概率抖动 (RPDF Dither)"],
+    [2, "2 · 三角概率抖动 (TPDF 标准抖动)"],
+    [3, "3 · 噪声整形抖动 (Noise-Shaped TPDF)"],
+  ],
+  "audio.adc_channel_mode": [
+    [0, "0 · 立体声正常 (Stereo)"],
+    [1, "1 · 强制单声道合并 (L+R Mono Sum)"],
+    [2, "2 · 伪立体声反相抵消 (L/R 极性接反，人声中置抵消空洞)"],
+    [3, "3 · 单边声道丢失 (仅左声道复制)"],
+  ],
+  "audio.pcodec_type": [
+    [0, "0 · 关闭"],
+    [1, "1 · MP3 (MPEG-1 Layer III 32子带+MDCT 水声/预回声)"],
+    [2, "2 · AAC-LC / HE-AAC (早期流媒体 3GP/FLV SBR 高频重建)"],
+    [3, "3 · AMR-NB (3GPP 移动语音代数码激励线性预测 4.75-12.2kbps)"],
+    [4, "4 · 早期流媒体低码率语音编码 (Speex / Nellymoser Asao 风格)"],
+  ],
+  "audio.telecom_mode": [
+    [0, "0 · 关闭"],
+    [1, "1 · PSTN 固话 / 2G GSM 窄带语音 (300-3400Hz)"],
+    [2, "2 · 早期 2G GSM 边缘弱信号 (217Hz TDMA 蜂音 + 突发丢包)"],
+    [3, "3 · 早期 Skype / QQ 语音通话 (VAD 静音门 + 丢包机器音拖尾)"],
+    [4, "4 · 现代会议软件劣质网络语音 (强降噪水声 + 回声抑制抽吸)"],
+  ],
+  "audio.telecom_wideband": [
+    [0, "0 · 窄带语音 Narrowband (300-3400Hz @ 8kHz)"],
+    [1, "1 · 宽带高清语音 Wideband HD Voice (50-7000Hz @ 16kHz)"],
+  ],
+  "audio.telecom_plc_mode": [
+    [0, "0 · 零填充硬静音断字 (Zero-Fill Hard Drop)"],
+    [1, "1 · 基音周期重复冻结 (Pitch-Waveform Repeat 机器音拖尾)"],
+    [2, "2 · 帧间交叉淡化插值 (Crossfade Interpolation)"],
+  ],
+  "audio.space_preset": [
+    [0, "0 · 直通干声 (Dry Anechoic)"],
+    [1, "1 · 小卧室桌面近讲 (早期优酷/播客桌面反射+电脑风扇底噪)"],
+    [2, "2 · 空旷瓷砖走廊 / 楼梯间 (强颤动回声 Flutter Echo + 高频反射)"],
+    [3, "3 · 教室 / 会议室远距离拾音 (低直达混响比 DRR + 空洞驻波)"],
+    [4, "4 · 户外开放街区环境 (无混响尾音 + 远距空气高频吸收 + 街区风噪)"],
+  ],
+  "audio.sys_audio_preset": [
+    [0, "0 · 现代标准直通 (Clean OS Mixer)"],
+    [1, "1 · Windows XP KMixer 44.1→48kHz 劣质重采样 + AC97 板载声卡"],
+    [2, "2 · 网页 Flash Player 播放器 (22.05kHz 降采样 + 音量推满削波)"],
+    [3, "3 · 3.5mm 耳机插头地线虚接 (L-R 人声消除伴奏卡拉OK效应)"],
+    [4, "4 · 廉价多媒体音箱 3D 环绕扩展 + 微笑曲线 EQ"],
+  ],
+  "audio.sys_src_mode": [
+    [0, "0 · 高质量重采样 (Transparent SRC)"],
+    [1, "1 · Windows KMixer 44.1→48kHz 线性插值劣化"],
+    [2, "2 · 网页 Flash Player 22.05kHz 降采样"],
+    [3, "3 · 11.025kHz 极低采样率缓冲"],
+  ],
+  "audio.sys_channel_map": [
+    [0, "0 · 正常立体声 (L / R)"],
+    [1, "1 · 左右声道反接 (R / L Swap)"],
+    [2, "2 · 左声道单边断线 (仅右声道)"],
+    [3, "3 · 3.5mm 插头地线松动脱落 (L-R 差模串扰，中置人声消失)"],
+    [4, "4 · 强制单声道混音 (Mono Mixdown)"],
+  ],
+  "audio.sys_eq_preset": [
+    [0, "0 · 平直 (Flat)"],
+    [1, "1 · 搖滚 / 微笑曲线 (V-Shape Bass+Treble Boost)"],
+    [2, "2 · 廉价塑料小音箱中频凸起 (Plastic Boxy)"],
+    [3, "3 · 深夜对白增强 (Vocal Mid Boost)"],
+  ],
+  "audio.ringtone_mode": [
+    [0, "0 · 关闭"],
+    [1, "1 · Nokia 单音压电蜂鸣器铃声 (Monophonic Piezo Square Buzzer)"],
+    [2, "2 · 早期 4/16 和弦 FM 合成铃声 (Yamaha MA-2/MA-3 OPL 芯片)"],
+    [3, "3 · 低比特 PCM 采样波表和弦铃声 (8-bit ADPCM SoundFont)"],
+    [4, "4 · 输入音频实时转写为复古和弦/蜂鸣器旋律 (Audio-to-Ringtone)"],
+  ],
+  "audio.loudness_mode": [
+    [0, "0 · 关闭"],
+    [1, "1 · 电视台 / 调频广播多段压限器 (Loudness War 高响度砖墙压限)"],
+    [2, "2 · 视频平台自动响度归一化 (YouTube / B站 -14 LUFS 峰值惩罚)"],
+    [3, "3 · 播客 / 移动流媒体响度标准 (-16 LUFS + 真峰值限制)"],
+    [4, "4 · 广电 EBU R 128 标准 (-23 LUFS 宽动态)"],
+  ],
+  "audio.av_drop_sync_mode": [
+    [0, "0 · 视频掉帧冻结但音频照常连续走带 (造成画面与声音错位)"],
+    [1, "1 · 音视频硬切同跳 (视频掉帧处音频同步丢块咔哒跳帧)"],
+    [2, "2 · 锁相环 PLL 柔性追赶重采样 (恢复同步时产生短暂音高滑音)"],
+  ],
+  "audio.av_edit_splice_mode": [
+    [0, "0 · 关闭"],
+    [1, "1 · 切点短暂静音缺口 (Mute Gap 8-25ms)"],
+    [2, "2 · 切点非过零点硬切爆音 + 直流阶跃 (Zero-Crossing Click & DC Pop)"],
+    [3, "3 · 切点相位跳变与磁迹重叠擦除瞬态 (Splice Overlap Transient)"],
   ],
   "overlay.style": [
     [0, "0 · 自定义（使用上方RGB参数）"],
@@ -2013,6 +2137,15 @@ function drawAudioScope(cursorT) {
       }
       if ((curFrameFault.head_switch_buzz || 0) > 0.1) tags.push("切头脉冲");
       if ((curFrameFault.hum_buzz || 0) > 0.02) tags.push("哼声/RF蜂音");
+      if (Math.abs(curFrameFault.av_offset_ms || 0) >= 5.0) {
+        const avm = curFrameFault.av_offset_ms;
+        tags.push(`AV偏移 ${avm >= 0 ? "+" : ""}${avm.toFixed(0)}ms`);
+      }
+      if (curFrameFault.av_drop_event) tags.push("掉帧失步");
+      if (curFrameFault.av_splice_transient) tags.push("切点瞬态");
+      if (_audioTl.summary && typeof _audioTl.summary.integrated_lufs === "number") {
+        tags.push(`${_audioTl.summary.integrated_lufs.toFixed(1)} LUFS`);
+      }
       badge.textContent = `${modeLabel} · ` + (tags.length ? tags.join(" | ") : "音画同步正常");
       badge.style.color = (curFrameFault.afm_unlock || curFrameFault.hdmi_drop) ? "#d9614c" : "";
     } else {
