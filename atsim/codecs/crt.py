@@ -256,8 +256,24 @@ def apply_scanline_beam(rgb: np.ndarray, base_row_mask: np.ndarray,
     mask0_norm = mask0 / max(1e-6, float(mask0.mean()))
 
     if bloom_k <= 1e-4:
-        # Apply vignette ratio from base_row_mask if present
-        vig_ratio = base_row_mask / np.maximum(1e-6, base_row_mask.mean(axis=0, keepdims=True))
+        # Divide the *base* beam profile out of `base_row_mask` and put the shifted one back in, so the
+        # mask is applied exactly once.  It used to be
+        #
+        #     vig_ratio = base_row_mask / base_row_mask.mean(axis=0, keepdims=True)
+        #     return rgb * (mask0_norm[..., None] * vig_ratio)
+        #
+        # and normalising per *column* leaves the beam structure in: a row mask is column-constant, so
+        # `base_row_mask` divided by its own column mean is that same mask again, and the frame received
+        # mask squared.  Measured on a flat field (the only input on which the mask's own gain is visible
+        # at all): out/input 1.38316 at a spot of 0.20, 1.10204 at 0.42, 1.00814 at 0.90, 1.00202 at
+        # 1.30 -- a **focus control that brightens the picture**, which is what the check
+        # "the scanline structure costs no light" was measuring as a 0.05210 mean drift on real content.
+        rows0 = np.arange(h, dtype=np.float32)[:, None]
+        centres0 = np.round(rows0 / pitch) * pitch
+        beam_base = np.exp(-0.5 * ((rows0 - centres0) / sigma0) ** 2)
+        mask_base = 1.0 - scanlines * (1.0 - beam_base)
+        mask_base = mask_base / max(1e-6, float(mask_base.mean()))
+        vig_ratio = base_row_mask / np.maximum(1e-6, mask_base[..., None])
         return (rgb * (mask0_norm[..., None] * vig_ratio)).astype(np.float32)
 
     # Local luminance (smoothed slightly along the scanline and across 1 row so the beam responds

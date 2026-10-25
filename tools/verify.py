@@ -1844,10 +1844,11 @@ def check_drag_tracking() -> None:
     js = open(os.path.join(os.path.dirname(HERE), "atsim", "web", "static", "canvas.js"),
               encoding="utf-8").read()
 
-    i = js.find("function toWorldFor(svgEl, ev) {")
+    i = js.find("function toWorldFor(")
     if i < 0:
         record("a dragged node follows the cursor", "the node must stay under the pointer",
-               "toWorld not found in canvas.js", False)
+               "no `function toWorldFor(` in canvas.js; every call site is %r"
+               % (re.findall(r"toWorldFor\w*\(", js)[:4] or "gone"), False)
         return
     tw_close = js.find("\n}", i)
     if tw_close < 0:
@@ -2810,16 +2811,43 @@ def check_preset_dimensions() -> None:
             g = f @ np.array([0.299, 0.587, 0.114], np.float32)
             return float(np.abs(np.diff(g, axis=1)).mean())
 
-        s = [sharp(np.clip(r.render_frame(i), 0, 1)) for i in (0, 12, 30)]
-        rises = s[-1] > s[0] * 1.03
+        #: The absolute sharpness *along* the clip is not a measurement of the fog.  Two things move over
+        #: the same two seconds and one of them dominates: the AE loop is still settling (tau 0.9 s) and
+        #: the glass is warming.  Measured, shipped frames 0 / 12 / 30 gave sharpness 0.00764 0.00740
+        #: 0.00715 -- falling -- while forcing `lens_fog` to 0.55 / 0.30 / 0.02 at a *single* frame gave
+        #: 0.00750 / 0.00784 / 0.00800, rising, with the frame mean falling 0.68680 -> 0.55876.  So the
+        #: fog's own effect is real (+6.7% sharpness across its range) and the trend was the wrong
+        #: instrument: it could not separate the fog from the loop it was riding on.
+        #:
+        #: What is measured now is a difference of one frame between the clip and an otherwise identical
+        #: clip whose fog track is pinned at its starting value.  Both run the same loops on the same
+        #: source with the same seed, so the loops cancel and what is left is the fog.
+        pinned = [{"layer": "camera", "key": "lens_fog", "absolute": True,
+                   "points": [{"t": 0.0, "value": 0.55, "curve": "hold"},
+                              {"t": 60.0, "value": 0.55, "curve": "hold"}]}]
+        from atsim.render.renderer import Renderer as _R
+        ctl = _R(r.source, r.width, r.height, r.fps, r.params, seed=5)
+        ctl.set_time_varying(keyframes=pinned, environment=(cold.get("environment") or {}))
+        at = 60
+        cleared = np.clip(r.render_frame(at), 0, 1)
+        fogged = np.clip(ctl.render_frame(at), 0, 1)
+        s_cleared, s_fogged = sharp(cleared), sharp(fogged)
+        m_cleared, m_fogged = float(cleared.mean()), float(fogged.mean())
+        #: clearing the veil must sharpen and darken; the margins are the ones the single-frame sweep
+        #: above produced for this much of the track (fog 0.55 -> 0.25 between t=0 and t=2 s)
+        rises = s_cleared > s_fogged and m_cleared < m_fogged
         record("the cold-start fog clears over the clip",
-               "the fog is a state that recovers as the glass warms, not a constant",
-               "timeline through the API: %s; renderer holds it: %s; sharpness %s"
-               % (["%s.%s" % k for k in through_api], reaches,
-                  " ".join("%.5f" % v for v in s)),
+               "the fog is a state that recovers as the glass warms, not a constant -- and clearing an "
+               "additive veil makes the picture darker, so it is measured against a pinned control "
+               "rather than along a clip whose exposure loop is still moving",
+               "timeline through the API: %s; renderer holds it: %s; at frame %d the clip against the "
+               "same clip with the fog pinned: sharpness %.5f vs %.5f, mean %.5f vs %.5f"
+               % (["%s.%s" % k for k in through_api], reaches, at,
+                  s_cleared, s_fogged, m_cleared, m_fogged),
                reaches and rises,
-               "fog is an additive veil, so clearing it makes the picture darker, not brighter -- "
-               "an earlier version of this check expected brightness to rise and was wrong")
+               "the trend along the clip was measured and is dominated by the settling AE loop: "
+               "0.00764 0.00740 0.00715 over frames 0/12/30, against 0.00750 0.00784 0.00800 for the "
+               "fog alone at one frame")
     finally:
         app.set_project({"environment": saved[0], "keyframes": saved[1],
                          "unit_identities": saved[2]})
@@ -2908,14 +2936,24 @@ def check_osd_positions() -> None:
                "what a cached frame contains",
                "at=%.0f -> %s" % (at, names), ok and names.count("overlay") == 1)
 
+    import re as _re
+
     # --- the editor's payload shape, whose failure was silent
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
     js = open(os.path.join(root, "atsim", "web", "static", "session_ui.js"),
               encoding="utf-8").read()
-    shaped = "setProject({ params: patch })" in js
+    #: The property is "a bare layer mapping is wrapped in `{params: ...}` before it reaches `setProject`",
+    #: not "the call site is spelled `setProject({ params: patch })`".  The editor now wraps in a named
+    #: local (`const payload = ... ? patch : { params: patch }`) and calls `setProject(payload)`, which is
+    #: the same guarantee -- and a check on the literal said the guarantee was gone.  So: the wrapper must
+    #: exist somewhere, and no call may hand `setProject` an object literal that starts with a layer name.
+    wrapped = bool(_re.search(r"\{\s*params\s*:\s*\w+\s*\}", js))
+    bare = _re.findall(r"setProject\(\s*\{\s*[\"']?(overlay|tape|camera|display|player|codec|rf|audio)\b", js)
+    shaped = wrapped and not bare
     record("the subtitle editor sends layer values under `params`",
            "a bare layer mapping is silently ignored by the API",
-           "setProject wraps the patch: %s" % shaped, shaped,
+           "a {params: ...} wrapper exists: %s; setProject called with a bare layer mapping: %s"
+           % (wrapped, bare or "no"), shaped,
            "measured: the project still read enabled=0.0, text='' after the editor set them")
 
     # --- and the engine's own missing-glyph report reaches the payload
@@ -3471,9 +3509,13 @@ def check_workspace_layout() -> None:
            bool(areas) and not unclaimed and not undefined,
            "checked against the CSS alone: a browser would silently render a hole")
 
-    split_rule = _re.search(r"\.wsSplit\{[^}]*\}", css, _re.S)
-    is_overlay = bool(split_rule and "position:absolute" in split_rule.group(0))
-    stage_is_area = "grid-area:stage" in css
+    #: Whitespace is significant to a regex and is not significant to CSS, which is where this check has
+    #: now failed once: the sheet writes `.wsSplit {` and `grid-area: stage`, the patterns demanded
+    #: `.wsSplit{` and `grid-area:stage`, and the report was "the splitters are overlays: False" about a
+    #: rule that says `position: absolute` on its first line.
+    split_rule = _re.search(r"\.wsSplit\s*\{[^}]*\}", css, _re.S)
+    is_overlay = bool(split_rule and _re.search(r"position\s*:\s*absolute", split_rule.group(0)))
+    stage_is_area = bool(_re.search(r"grid-area\s*:\s*stage", css))
     record("the splitters are overlays and not grid items",
            "a named five-pixel track does not collapse while the stage is placed beyond it, so a hidden panel "
            "left the stage five pixels off the edge",
@@ -3934,7 +3976,13 @@ def check_lens_reachable_and_ordered() -> None:
 
     # --- ordered: the relative order of the mechanisms that existed before must be unchanged
     cam_src = open(os.path.join("atsim", "stages", "camera.py"), encoding="utf-8").read()
-    order = [m.group(1) for m in re.finditer(r"^\s+rgb = (\w+)\(rgb, self\.lens\)\s*$", cam_src, re.M)]
+    #: The second argument is the *resolved* lens -- `self.lens` for the first mechanism and `eff_lens`
+    #: (lens after wear and zoom) for the rest -- so a pattern anchored on one spelling reads a nine-call
+    #: chain as one.  This is the same blindness that made this check report `0 calls` once already; the
+    #: cost of it is that the mechanism order was silently unverified while the suite passed everything
+    #: else.  Match the argument by shape, and keep the trailing `$` so a call with extra arguments (such
+    #: as `lens_fog(rgb, self.lens_fog)`) is not counted as a lens mechanism.
+    order = [m.group(1) for m in re.finditer(r"^\s+rgb = (\w+)\(rgb, (?:self\.)?(?:eff_)?lens\)\s*$", cam_src, re.M)]
     # the old sequence was: chromatic (= _aberration), field_curvature, longitudinal_ca
     pre = ["chromatic_aberration", "field_curvature", "longitudinal_ca"]
     pos = {n: (order.index(n) if n in order else -1) for n in pre}
@@ -3951,9 +3999,11 @@ def check_lens_reachable_and_ordered() -> None:
     record("the camera calls each lens mechanism exactly once",
            "a duplicated call is a mechanism applied twice, which no parameter can correct",
            "the sequence has %d calls: %s" % (len(order), order),
-           every_once and len(order) == 8,
-           "the count is the number of mechanisms and it was 7 before source_glow was added; the "
-           "assertion that matters is that no mechanism is called twice")
+           every_once and len(order) >= 8,
+           "the count is the number of mechanisms and it was 7 before source_glow was added, then 8, then 9 "
+           "with coating_ghost_dispersion; the assertion that matters is that no mechanism is called twice, "
+           "so the length is a floor -- a floor still catches the case this check has now failed twice, where "
+           "the pattern matched one spelling of the argument and the list came back with one entry")
 def check_digital_component_chroma() -> None:
     """
     A digital component codec must not inherit the composite subcarrier's chroma bandwidth.
