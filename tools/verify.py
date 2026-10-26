@@ -1217,7 +1217,7 @@ def check_mpeg1_branch() -> None:
 # Checks that are cheap enough to run with `--quick`.  A check not listed here is
 # skipped under `--quick`, deliberately: a missing check is visible, an accidentally
 # included slow one is not.
-QUICK = ("check_consistency", "check_engine", "check_presets", "check_shuttle", "check_rf_tv_dx_subsystem", "check_crt_physics_realism", "check_sync_and_power_systems", "check_crt_reshoot_system", "check_transport_servo_system", "check_analog_switcher_system", "check_broadcast_scopes_system", "check_trv310e_and_vhs_head_calibration", "check_patchbay_da_system", "check_multiview_and_test_generator_systems", "check_ccu_genlock_and_master_playout_systems", "check_transfer_and_editing_systems", "check_automation_satellite_transmitter_systems", "check_audio_simulation_and_av_sync")
+QUICK = ("check_consistency", "check_engine", "check_presets", "check_shuttle", "check_rf_tv_dx_subsystem", "check_crt_physics_realism", "check_sync_and_power_systems", "check_crt_reshoot_system", "check_transport_servo_system", "check_analog_switcher_system", "check_broadcast_scopes_system", "check_trv310e_and_vhs_head_calibration", "check_patchbay_da_system", "check_multiview_and_test_generator_systems", "check_ccu_genlock_and_master_playout_systems", "check_transfer_and_editing_systems", "check_automation_satellite_transmitter_systems", "check_audio_simulation_and_av_sync", "check_desktop_gui_system")
 
 
 def _discover_checks() -> list[str]:
@@ -7822,6 +7822,55 @@ def check_automation_satellite_transmitter_systems() -> None:
         f"tested={len(new_presets) + 3}, errors={len(preset_render_errors)}",
         bool(len(preset_render_errors) == 0),
     )
+
+
+def check_desktop_gui_system() -> None:
+    """Verify the low-memory Native Desktop GUI controller, PIL renderers, and memory reclamation."""
+    from atsim.desktop.controller import DesktopBackendController, SELECTORS, PRESET_CATEGORIES
+    from atsim.desktop.app import build_node_graph_pil
+    from PIL import Image
+
+    ctrl = DesktopBackendController(low_memory=True)
+    # 1. Verify schema, presets, and 100+ discrete selectors synced with WebUI
+    sel_count = len(SELECTORS)
+    cat_count = len(PRESET_CATEGORIES)
+    factory_list = ctrl.get_preset_entries("factory")
+
+    # 2. Verify zero-encode numpy & PIL viewport rendering + A/B split comparison
+    ctrl.ab_enabled = True
+    ctrl.split_x = 0.5
+    vp_img = ctrl.render_viewport_pil(canvas_w=480, canvas_h=320)
+
+    # 3. Verify lazy Broadcast Scopes & Audio Oscilloscope rendering
+    sc_img, sc_data = ctrl.render_scopes_pil(width=600, height=150)
+    wav_bytes, tl = ctrl.synthesize_audio_window(duration_s=0.8)
+    aud_img, badge = ctrl.render_audio_scope_pil(width=400, height=36)
+
+    # 4. Verify interactive Node Graph PIL rendering & hit-test maps
+    g_img, n_boxes, p_centers = build_node_graph_pil(ctrl, width=720, height=420)
+
+    # 5. Verify one-click memory cleanup clears renderer & graph caches
+    mem_info = ctrl.free_memory()
+    caches_cleared = (len(ctrl.app.store._renderers) == 0 and len(ctrl.app._graph_execs) == 0)
+
+    ok = bool(
+        sel_count >= 100
+        and cat_count >= 8
+        and len(factory_list) >= 10
+        and isinstance(vp_img, Image.Image) and vp_img.width > 0
+        and isinstance(sc_img, Image.Image) and "waveform" in sc_data
+        and wav_bytes[:4] == b"RIFF"
+        and isinstance(aud_img, Image.Image) and len(badge) > 0
+        and isinstance(g_img, Image.Image) and len(n_boxes) > 0 and len(p_centers) > 0
+        and caches_cleared
+    )
+    record(
+        "Native Low-Memory Desktop GUI Controller & Zero-HTTP Renderers",
+        "DesktopBackendController renders viewport, A/B split, broadcast scopes, audio WAV/scope, and node graph in-process with >=100 selectors and 0 residual caches after free_memory()",
+        f"selectors={sel_count}, presets={len(factory_list)}, vp={vp_img.size}, nodes={len(n_boxes)}, caches_cleared={caches_cleared}",
+        ok,
+    )
+
 
 if __name__ == "__main__":
     raise SystemExit(main())

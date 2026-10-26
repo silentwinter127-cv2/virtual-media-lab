@@ -296,3 +296,29 @@ Virtual-Media-Lab/
 | **08** | **铃声、MIDI 与移动音源** (`MobileRingtoneSynthSpec`) | Nokia 单音压电蜂鸣器方波铃声 (Monophonic Piezo Buzzer)、Yamaha MA-2/MA-3 (OPL) 4/16 和弦 FM 合成芯片、严格最大复音数限制 (1/4/16/64) 与硬件抢音截断 (Voice Stealing)、低比特 PCM 波表、音序器节拍时间量化抖动、阶梯包络以及实时输入音频转写复古铃声旋律 | `audio.ringtone_*` |
 | **09** | **广播与网络平台的响度处理** (`LoudnessProcessorSpec`) | 完整实现 ITU-R BS.1770-4 / EBU R 128 K 加权综合响度测量 (Integrated LUFS)、响度范围 (LRA)、峰值因子 (Crest Factor) 与 4 倍过采样真峰值检测 (True Peak dBTP)；模拟电台/电视多段响度大战压限器 (Optimod 风格)、视频平台自动响度归一化 (-14 / -16 / -23 LUFS 惩罚削减) 与多平台二次上传重编码动态坍塌 | `audio.loudness_*` |
 | **10** | **音视频同步与时钟系统** (`AVSyncClockSpec` / `AVSyncClockStage`) | 统一视频帧时间戳 (PTS) 与音频采样时钟对位、固定唇音偏移 (ms)、晶振时钟漂移 (ppm) 引发的随时间线性累积音画跑偏、视频掉帧/重复帧 vs 音频 FIFO 滑移或锁相环 PLL 变调追赶、以及磁带/非编切点瞬态（静音缺口 / 非过零点硬切爆音 / 相位跳变），将摄像、DV、磁带、广电、剪辑、流媒体与音频系统彻底收口为统一整体 | `audio.av_*`, 节点 `av_sync_clock` |
+
+
+## 🖥️ 原生低内存桌面端工作站 (Native Desktop GUI)
+
+针对浏览器 WebUI 在长时间高分辨率预览、连续示波器轮询及多窗口 Canvas 渲染时容易出现的**内存与 CPU 占用过高**问题，工程提供了与 WebUI 布局及功能 1:1 对齐的**原生桌面端工作站 (`desktop.py` / `run_desktop.bat`)**：
+
+### 为什么桌面端能大幅降低资源占用？
+1. **零浏览器开销与零 HTTP 轮询**：不再启动本地 HTTP 服务器与 Chromium/Edge 浏览器进程（直接省去 300–800 MB 浏览器 DOM/Canvas 内存）。
+2. **零预览帧 PNG/JPEG 编码与解码损耗**：WebUI 每次拖动滑块都需要将帧编码为 PNG/JPEG 并通过 HTTP 传输给浏览器解码；桌面端直接在进程内将 `Renderer` / `GraphExecutor` 输出的 `uint8 (H, W, 3)` 内存数组直传给 `PIL.ImageTk.PhotoImage` 显存位图。
+3. **严格受限的 LRU 帧缓存 (`max_cache_frames=2`) 与一键内存释放**：默认限制单实例 `Renderer` 与最多 2 帧阶段缓存，顶部状态栏实时显示进程 `RAM (MB)` 与 `帧耗时 (ms)`，并提供 `🧹 释放内存` 按钮一键清空所有阶段缓存与触发 `gc.collect()`。
+4. **按需惰性计算 (Lazy Evaluation)**：`📊 广播示波器`（Tektronix 1740A IRE 波形、矢量示波器、0–6.5MHz 功率谱）与 `▶ 试听伴音 (3s)` 仅在展开抽屉或点击试听时计算，收起时后台零 CPU 占用。
+
+### 启动方式
+```bash
+# Windows 双击一键启动：
+run_desktop.bat
+
+# 或命令行启动（默认开启低内存模式）：
+python desktop.py
+
+# 启动时直接加载指定视频或图片素材：
+python desktop.py --clip path/to/video.mp4
+
+# 运行桌面端无头自检测试：
+python desktop.py --self-test
+```
