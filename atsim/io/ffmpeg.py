@@ -270,15 +270,39 @@ class VideoReader:
     def frame_bytes(self) -> int:
         return self.out_w * self.out_h * 3
 
-    def frames(self) -> Iterator[np.ndarray]:
+    def frames_u8(self) -> Iterator[np.ndarray]:
         assert self._proc is not None and self._proc.stdout is not None
         n = self.frame_bytes
         while True:
             raw = self._proc.stdout.read(n)
             if not raw or len(raw) < n:
                 break
+            yield np.frombuffer(raw, dtype=np.uint8).reshape(self.out_h, self.out_w, 3).copy()
+
+    def frames(self) -> Iterator[np.ndarray]:
+        assert self._proc is not None and self._proc.stdout is not None
+        n = self.frame_bytes
+        scale_f = np.float32(1.0 / 255.0)
+        try:
+            import cv2 as _cv2
+            lut = getattr(VideoReader, "_U8_LUT", None)
+            if lut is None:
+                lut = (np.arange(256, dtype=np.float32) * scale_f).reshape(256, 1)
+                VideoReader._U8_LUT = lut
+            _have_cv = True
+        except Exception:
+            _cv2 = None
+            lut = None
+            _have_cv = False
+        while True:
+            raw = self._proc.stdout.read(n)
+            if not raw or len(raw) < n:
+                break
             arr = np.frombuffer(raw, dtype=np.uint8).reshape(self.out_h, self.out_w, 3)
-            yield arr.astype(np.float32) / 255.0
+            if _have_cv:
+                yield _cv2.LUT(arr, lut)
+            else:
+                yield arr.astype(np.float32) * scale_f
 
     def frame_at(self, index: int) -> np.ndarray | None:
         """Random access: decode from just before `index` and discard."""
@@ -429,7 +453,7 @@ class VideoWriter:
             #: evidence.  The trailing `?` makes the map *conditional*: audio is carried when it exists and silently
             #: omitted when it does not, which is what "keep the audio if there is any" was supposed to mean.
             cmd += ["-map", "1:a:0?", "-c:a", audio_codec, "-shortest"]
-        cmd += ["-c:v", self.codec, "-threads", "2", "-crf", str(self.crf), "-preset", self.preset,
+        cmd += ["-c:v", self.codec, "-threads", "0", "-crf", str(self.crf), "-preset", self.preset,
                 "-pix_fmt", self.pix_fmt]
         cmd += self.extra
         cmd += [self.out_path]
@@ -444,22 +468,23 @@ class VideoWriter:
             stderr=subprocess.PIPE, creationflags=_creationflags())
         return self
 
-    def write(self, rgb: np.ndarray) -> None:
+    def write_u8(self, arr: np.ndarray) -> None:
         assert self._proc is not None and self._proc.stdin is not None
-        arr = np.clip(rgb, 0.0, 1.0)
-        if arr.dtype != np.uint8:
-            arr = (arr * 255.0 + 0.5).astype(np.uint8)
-        #: **A frame at the renderer's own size is accepted and padded to the encoded size**, so the odd-dimension fix
-        #: above does not push a size requirement onto every caller.  The incoming shape must be one of the two the
-        #: writer knows about: the caller's own, or the padded one.
         if arr.shape[0] == self.in_height and arr.shape[1] == self.in_width:
             if (self.height, self.width) != (self.in_height, self.in_width):
                 arr = np.pad(arr, ((0, self.height - self.in_height), (0, self.width - self.in_width), (0, 0)),
                              mode="edge")
         if arr.shape[0] != self.height or arr.shape[1] != self.width:
             raise ValueError(f"frame size {arr.shape[:2]} != {self.height, self.width}")
-        self._proc.stdin.write(np.ascontiguousarray(arr).tobytes())
+        self._proc.stdin.write(np.ascontiguousarray(arr, dtype=np.uint8).tobytes())
         self.frames_written += 1
+
+    def write(self, rgb: np.ndarray) -> None:
+        if rgb.dtype == np.uint8:
+            self.write_u8(rgb)
+            return
+        arr = (np.clip(rgb, 0.0, 1.0) * np.float32(255.0) + np.float32(0.5)).astype(np.uint8)
+        self.write_u8(arr)
 
     def close(self) -> None:
         if self._proc is None:

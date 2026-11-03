@@ -32,7 +32,36 @@ class ClipSource:
         self.frame_count = self.info.frame_count
         self._cache: OrderedDict[int, np.ndarray] = OrderedDict()
         self._last_frame: np.ndarray | None = None
+        self._seq_reader: VideoReader | None = None
+        self._seq_iter: Iterator[np.ndarray] | None = None
+        self._seq_next_idx: int = -1
+        self._last_req_idx: int = -2
         self._lock = threading.Lock()
+
+    def _close_seq(self) -> None:
+        if self._seq_reader is not None:
+            try:
+                self._seq_reader.close()
+            except Exception:
+                pass
+            self._seq_reader = None
+            self._seq_iter = None
+            self._seq_next_idx = -1
+
+    def iter_sequential_u8(self, start: int = 0, count: int | None = None) -> Iterator[tuple[int, np.ndarray]]:
+        """Stream raw uint8 (H, W, 3) frames from a single continuous FFmpeg pipe."""
+        with VideoReader(self.path, self.info, self.scale, start=start, count=count,
+                         width=self.width, height=self.height) as r:
+            last_u8: np.ndarray | None = None
+            idx = int(start)
+            for f_u8 in r.frames_u8():
+                last_u8 = f_u8
+                yield idx, f_u8
+                idx += 1
+            if count is not None and last_u8 is not None:
+                while idx < start + count:
+                    yield idx, last_u8
+                    idx += 1
 
     # ------------------------------------------------------------------
     def frame(self, index: int) -> np.ndarray:
@@ -41,9 +70,54 @@ class ClipSource:
             hit = self._cache.get(index)
             if hit is not None:
                 self._cache.move_to_end(index)
+                self._last_req_idx = index
                 return hit
-        # Decode a small contiguous chunk per FFmpeg invocation so linear renders
-        # spawn 16x fewer subprocesses while keeping memory strictly bounded.
+            # Check if our persistent sequential FFmpeg pipe is positioned right at or just before `index`
+            if self._seq_iter is not None and 0 <= (index - self._seq_next_idx) <= 4:
+                got_seq: np.ndarray | None = None
+                try:
+                    while self._seq_next_idx <= index:
+                        f_arr = next(self._seq_iter)
+                        cur_i = self._seq_next_idx
+                        self._seq_next_idx += 1
+                        self._last_frame = f_arr
+                        self._cache[cur_i] = f_arr
+                        self._cache.move_to_end(cur_i)
+                        while len(self._cache) > self.cache_frames:
+                            self._cache.popitem(last=False)
+                        if cur_i == index:
+                            got_seq = f_arr
+                except StopIteration:
+                    self._close_seq()
+                except Exception:
+                    self._close_seq()
+                if got_seq is not None:
+                    self._last_req_idx = index
+                    return got_seq
+
+            is_sequential = (index == 0 or index == self._last_req_idx + 1)
+            self._last_req_idx = index
+            if is_sequential:
+                self._close_seq()
+                try:
+                    sr = VideoReader(self.path, self.info, self.scale, start=index, count=None,
+                                     width=self.width, height=self.height)
+                    sr.__enter__()
+                    sit = sr.frames()
+                    first_f = next(sit)
+                    self._seq_reader = sr
+                    self._seq_iter = sit
+                    self._seq_next_idx = index + 1
+                    self._last_frame = first_f
+                    self._cache[index] = first_f
+                    self._cache.move_to_end(index)
+                    while len(self._cache) > self.cache_frames:
+                        self._cache.popitem(last=False)
+                    return first_f
+                except Exception:
+                    self._close_seq()
+
+        # Non-sequential random access (UI scrubbing): decode a small contiguous chunk
         chunk = min(16, max(1, self.cache_frames // 2))
         if self.frame_count > 0:
             chunk = max(1, min(chunk, self.frame_count - index))
@@ -109,6 +183,7 @@ class ClipSource:
 
     def clear(self) -> None:
         with self._lock:
+            self._close_seq()
             self._cache.clear()
 
 

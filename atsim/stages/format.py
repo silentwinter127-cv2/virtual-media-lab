@@ -153,12 +153,24 @@ class FormatStage(Stage):
             if self.chroma_vavg > 1e-4:
                 k = float(np.clip(self.chroma_vavg, 0.0, 1.0))
                 v_sig = 1.35 * (h / 540.0) if h > 580 else 1.35
-                i = (1.0 - k) * i + k * lowpass(i, v_sig, axis=0)
-                q = (1.0 - k) * q + k * lowpass(q, v_sig, axis=0)
+                from ..core.signal import get_native_lib, gaussian_half_kernel
+                lib = get_native_lib()
+                kh, r_k = gaussian_half_kernel(v_sig)
+                if lib is not None and r_k > 0 and r_k <= 32 and i.ndim == 2 and i.dtype == np.float32:
+                    ic = np.ascontiguousarray(i, dtype=np.float32)
+                    qc = np.ascontiguousarray(q, dtype=np.float32)
+                    io = np.empty_like(ic)
+                    qo = np.empty_like(qc)
+                    lib.vml_sym_fir_vert_f32(ic.ctypes.data, io.ctypes.data, kh.ctypes.data, r_k, h, w, 1, float(1.0 - k), float(k))
+                    lib.vml_sym_fir_vert_f32(qc.ctypes.data, qo.ctypes.data, kh.ctypes.data, r_k, h, w, 1, float(1.0 - k), float(k))
+                    i, q = io, qo
+                else:
+                    i = (1.0 - k) * i + k * lowpass(i, v_sig, axis=0)
+                    q = (1.0 - k) * q + k * lowpass(q, v_sig, axis=0)
         i, q = self._lag_chroma(i, q, index)
         if abs(self.chroma_gain - 1.0) > 1e-4:
-            i = i * self.chroma_gain
-            q = q * self.chroma_gain
+            i = i * np.float32(self.chroma_gain)
+            q = q * np.float32(self.chroma_gain)
         return i, q
 
     def _lag_chroma(self, i: np.ndarray, q: np.ndarray,
@@ -223,13 +235,29 @@ class FormatStage(Stage):
             ph = self._line_phase.advance(i.shape[0]) * 0.9
             fp = self._field_phase.prefix(buf.index + field + 1)[-1] * 0.5
             ph = ph + fp
-            cos_p = np.cos(ph)[:, None].astype(np.float32)
-            sin_p = np.sin(ph)[:, None].astype(np.float32)
-            amp = self.color_noise * 0.018
+            amp = float(self.color_noise * 0.018)
             n = self._noise_for(i.shape, buf.index)
-            env = 0.55 + 0.75 * np.abs(self._noise_env_for(i.shape, buf.index))
-            i = i + amp * (n * env) * cos_p
-            q = q + amp * (n * env) * sin_p
+            n_env = self._noise_env_for(i.shape, buf.index)
+            from ..core.signal import get_native_lib
+            lib = get_native_lib()
+            if lib is not None and i.ndim == 2 and i.dtype == np.float32:
+                ic = np.ascontiguousarray(i, dtype=np.float32)
+                qc = np.ascontiguousarray(q, dtype=np.float32)
+                cos_1d = np.ascontiguousarray(np.cos(ph), dtype=np.float32)
+                sin_1d = np.ascontiguousarray(np.sin(ph), dtype=np.float32)
+                lib.vml_format_color_noise_f32(
+                    ic.ctypes.data, qc.ctypes.data,
+                    n.ctypes.data, n_env.ctypes.data,
+                    cos_1d.ctypes.data, sin_1d.ctypes.data,
+                    amp, ic.shape[0], ic.shape[1],
+                )
+                i, q = ic, qc
+            else:
+                cos_p = np.cos(ph)[:, None].astype(np.float32)
+                sin_p = np.sin(ph)[:, None].astype(np.float32)
+                env = 0.55 + 0.75 * np.abs(n_env)
+                i = i + amp * (n * env) * cos_p
+                q = q + amp * (n * env) * sin_p
             out_phase = float(ph.mean())
 
         comp = composite_encode(y, i, q, self.std, chroma_gain=0.63)
@@ -243,7 +271,7 @@ class FormatStage(Stage):
         out.meta["signal"] = frame
         out.meta["format"] = "composite"
         out.meta["chroma_phase"] = out_phase
-        out.meta["tap_format_rgb"] = frame.to_rgb()
+        out.meta["tap_format_signal"] = frame
         if self.test_spec.is_active():
             out.meta["tap_camera_rgb"] = rgb
         return out

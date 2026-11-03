@@ -117,20 +117,30 @@ class OUProcess:
     def prefix(self, n: int) -> np.ndarray:
         """
         The first `n` samples from a fresh start (does not disturb state).
-
-        Per-frame stages that need "the value of this slow process as of frame
-        k" use this: the transport really did run through those samples on the
-        way here, so recomputing the prefix is physically correct, and it is
-        O(n) once rather than O(n) per frame.
+        Cached incrementally so sequential 36,000-frame exports are O(1) per frame
+        instead of O(N^2) while preserving exact determinism.
         """
         n = int(max(0, n))
         if n == 0:
             return np.zeros(0, dtype=np.float64)
-        keep = self._state
-        self._state = 0.0
-        out = self.advance(n)
-        self._state = keep
-        return out
+        buf = getattr(self, "_prefix_buf", None)
+        if buf is None:
+            buf = np.zeros(0, dtype=np.float64)
+            self._prefix_buf = buf
+            self._prefix_state = 0.0
+        if len(buf) < n:
+            from scipy.signal import lfilter
+            need = max(n - len(buf), 256)
+            theta = self.theta
+            w = self.rng.standard_normal(need)
+            zi = np.array([(1.0 - theta) * self._prefix_state], dtype=np.float64)
+            chunk, zf = lfilter([theta], [1.0, -(1.0 - theta)], w, zi=zi)
+            self._prefix_state = float(zf[0]) / max(1e-12, 1.0 - theta)
+            if self.sigma != 1.0:
+                chunk = chunk * float(self.sigma)
+            buf = np.concatenate([buf, chunk.astype(np.float64)])
+            self._prefix_buf = buf
+        return buf[:n]
 
 
 # ---------------------------------------------------------------------------
@@ -183,23 +193,48 @@ class ValueNoise3D:
         self._x1 = self._x0 + 1
         self._wy = (self._fy - self._y0)[:, None].astype(np.float32)
         self._wx = (self._fx - self._x0)[None, :].astype(np.float32)
+        self._wy_1d = np.ascontiguousarray(self._wy.reshape(-1), dtype=np.float32)
+        self._wx_1d = np.ascontiguousarray(self._wx.reshape(-1), dtype=np.float32)
+
+    def sample_origin(self, frame_index: int) -> float:
+        """Return the scalar value at (0, 0) without allocating a full (H, W) array."""
+        t = frame_index / self.time_scale * self.temporal_drift
+        t0 = int(np.floor(t)) % self._gt
+        t1 = (t0 + 1) % self._gt
+        ft = float(t - np.floor(t))
+        v0 = float(self._lattice[t0, 0, 0])
+        v1 = float(self._lattice[t1, 0, 0])
+        return v0 + (v1 - v0) * ft
 
     def sample(self, frame_index: int) -> np.ndarray:
         """Return a (H, W) float32 field with zero mean, unit-ish variance."""
         t = frame_index / self.time_scale * self.temporal_drift
         t0 = int(np.floor(t)) % self._gt
         t1 = (t0 + 1) % self._gt
-        ft = np.float32(t - np.floor(t))
+        ft = float(t - np.floor(t))
 
+        from .signal import get_native_lib
+        lib = get_native_lib()
+        if lib is not None:
+            lat0 = np.ascontiguousarray(self._lattice[t0], dtype=np.float32)
+            lat1 = np.ascontiguousarray(self._lattice[t1], dtype=np.float32)
+            out = np.empty((self.height, self.width), dtype=np.float32)
+            lib.vml_value_noise_sample_f32(
+                lat0.ctypes.data, lat1.ctypes.data, ft,
+                self._y0.ctypes.data, self._wy_1d.ctypes.data,
+                self._x0.ctypes.data, self._wx_1d.ctypes.data,
+                out.ctypes.data, self.height, self.width, self._gx,
+            )
+            return out
+
+        ft_f32 = np.float32(ft)
         lat0 = self._lattice[t0]
         lat1 = self._lattice[t1]
-        lat = lat0 + (lat1 - lat0) * ft
+        lat = lat0 + (lat1 - lat0) * ft_f32
 
         y0, y1 = self._y0, self._y1
         x0, x1 = self._x0, self._x1
-        # Interpolate Y first on the coarse (H, gx) grid (contiguous axis-0 slice)
         col_y = lat[y0] + (lat[y1] - lat[y0]) * self._wy
-        # Then interpolate X in-place on (H, W)
         c0 = col_y[:, x0]
         c1 = col_y[:, x1]
         c1 -= c0
@@ -242,11 +277,15 @@ def bandlimited_noise(rng: np.random.Generator, shape: Sequence[int],
     n = rng.standard_normal(shape).astype(np.float32)
     if corr_x > 1.001:
         a = 1.0 - 1.0 / float(corr_x)
-        n = lfilter([1.0 - a], [1.0, -a], n, axis=1).astype(np.float32)
+        b_x = np.array([1.0 - a], dtype=np.float32)
+        a_x = np.array([1.0, -a], dtype=np.float32)
+        n = lfilter(b_x, a_x, n, axis=1).astype(np.float32, copy=False)
     if corr_y > 1.001:
         a = 1.0 - 1.0 / float(corr_y)
-        n = lfilter([1.0 - a], [1.0, -a], n, axis=0).astype(np.float32)
+        b_y = np.array([1.0 - a], dtype=np.float32)
+        a_y = np.array([1.0, -a], dtype=np.float32)
+        n = lfilter(b_y, a_y, n, axis=0).astype(np.float32, copy=False)
     s = float(n.std())
     if s > 1e-9:
-        n /= s
+        n /= np.float32(s)
     return n

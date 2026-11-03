@@ -400,10 +400,22 @@ def longitudinal_ca(rgb: np.ndarray, spec: LensSpec) -> np.ndarray:
     if spec.longitudinal_ca < 1e-4:
         return rgb
     a = float(spec.longitudinal_ca)
-    r = lowpass(rgb[..., 0], 1.0 + 3.0 * a)
-    g = lowpass(rgb[..., 1], 1.0 + 0.4 * a)
-    b = lowpass(rgb[..., 2], 1.0 + 3.4 * a)
-    return np.stack([r, g, b], axis=-1).astype(np.float32)
+    try:
+        import cv2 as _cv2
+        r0, g0, b0 = _cv2.split(np.ascontiguousarray(rgb, dtype=np.float32))
+        r = lowpass(r0, 1.0 + 3.0 * a)
+        g = lowpass(g0, 1.0 + 0.4 * a)
+        b = lowpass(b0, 1.0 + 3.4 * a)
+        return _cv2.merge((r, g, b))
+    except Exception:
+        r = lowpass(rgb[..., 0], 1.0 + 3.0 * a)
+        g = lowpass(rgb[..., 1], 1.0 + 0.4 * a)
+        b = lowpass(rgb[..., 2], 1.0 + 3.4 * a)
+        return np.stack([r, g, b], axis=-1).astype(np.float32)
+
+
+_CA_WARP_CACHE: dict[tuple, dict[int, tuple]] = {}
+_SMEAR_KERNEL_CACHE: dict[tuple, tuple] = {}
 
 
 def chromatic_aberration(rgb: np.ndarray, spec: LensSpec) -> np.ndarray:
@@ -415,21 +427,41 @@ def chromatic_aberration(rgb: np.ndarray, spec: LensSpec) -> np.ndarray:
     a = float(spec.chroma_aberration)
     h, w = rgb.shape[:2]
     dx, dy = spec.axis_shift()
-    yy = np.arange(h, dtype=np.float32)
-    xx = np.arange(w, dtype=np.float32)
-    cx = (w - 1) * 0.5 * (1.0 + dx)
-    cy = (h - 1) * 0.5 * (1.0 + dy)
+    key = (int(h), int(w), round(a, 6), round(float(dx), 6), round(float(dy), 6))
+    tables = _CA_WARP_CACHE.get(key)
+    if tables is None:
+        yy = np.arange(h, dtype=np.float32)
+        xx = np.arange(w, dtype=np.float32)
+        cx = (w - 1) * 0.5 * (1.0 + dx)
+        cy = (h - 1) * 0.5 * (1.0 + dy)
+        tables = {}
+        for ch, scale in ((0, 1.0 + 0.012 * a), (2, 1.0 - 0.012 * a)):
+            sx = np.clip(cx + (xx - cx) / scale, 0, w - 1)
+            sy = np.clip(cy + (yy - cy) / scale, 0, h - 1)
+            x0 = np.floor(sx).astype(np.int32)
+            y0 = np.floor(sy).astype(np.int32)
+            x1 = np.clip(x0 + 1, 0, w - 1)
+            y1 = np.clip(y0 + 1, 0, h - 1)
+            fx = (sx - x0)[None, :].astype(np.float32)
+            fy = (sy - y0)[:, None].astype(np.float32)
+            tables[ch] = (x0, x1, fx, y0, y1, fy)
+        if len(_CA_WARP_CACHE) > 32:
+            _CA_WARP_CACHE.pop(next(iter(_CA_WARP_CACHE)), None)
+        _CA_WARP_CACHE[key] = tables
+
+    try:
+        import cv2 as _cv2
+        r0, g0, b0 = _cv2.split(np.ascontiguousarray(rgb, dtype=np.float32))
+        planes = {0: r0, 1: g0, 2: b0}
+        _have_cv = True
+    except Exception:
+        planes = {0: rgb[..., 0], 1: rgb[..., 1], 2: rgb[..., 2]}
+        _have_cv = False
+
     warped: dict[int, np.ndarray] = {}
-    for ch, scale in ((0, 1.0 + 0.012 * a), (2, 1.0 - 0.012 * a)):
-        sx = np.clip(cx + (xx - cx) / scale, 0, w - 1)
-        sy = np.clip(cy + (yy - cy) / scale, 0, h - 1)
-        x0 = np.floor(sx).astype(np.int32)
-        y0 = np.floor(sy).astype(np.int32)
-        x1 = np.clip(x0 + 1, 0, w - 1)
-        y1 = np.clip(y0 + 1, 0, h - 1)
-        fx = (sx - x0)[None, :]
-        fy = (sy - y0)[:, None]
-        plane = rgb[..., ch]
+    for ch in (0, 2):
+        x0, x1, fx, y0, y1, fy = tables[ch]
+        plane = planes[ch]
         row_y = plane[y0] + (plane[y1] - plane[y0]) * fy
         c0 = row_y[:, x0]
         c1 = row_y[:, x1]
@@ -439,7 +471,115 @@ def chromatic_aberration(rgb: np.ndarray, spec: LensSpec) -> np.ndarray:
         warped[ch] = c1
     r = lowpass(warped[0], 2.2 * a)
     b = lowpass(warped[2], 2.6 * a)
-    g = lowpass(rgb[..., 1], 0.35 * a)
+    g = lowpass(planes[1], 0.35 * a)
+    if _have_cv:
+        return _cv2.merge((r, g, b))
+    return np.stack([r, g, b], axis=-1).astype(np.float32, copy=False)
+
+
+def chromatic_and_longitudinal_ca(rgb: np.ndarray, spec: LensSpec) -> np.ndarray:
+    """Fused lateral + longitudinal chromatic aberration when field_curvature is inactive."""
+    a_lat = float(spec.chroma_aberration)
+    a_lon = float(spec.longitudinal_ca)
+    if a_lat < 1e-4 and a_lon < 1e-4:
+        return rgb
+    if a_lat < 1e-4:
+        return longitudinal_ca(rgb, spec)
+    if a_lon < 1e-4:
+        return chromatic_aberration(rgb, spec)
+    h, w = rgb.shape[:2]
+    dx, dy = spec.axis_shift()
+    key = (int(h), int(w), round(a_lat, 6), round(float(dx), 6), round(float(dy), 6))
+    tables = _CA_WARP_CACHE.get(key)
+    if tables is None:
+        yy = np.arange(h, dtype=np.float32)
+        xx = np.arange(w, dtype=np.float32)
+        cx = (w - 1) * 0.5 * (1.0 + dx)
+        cy = (h - 1) * 0.5 * (1.0 + dy)
+        tables = {}
+        for ch, scale in ((0, 1.0 + 0.012 * a_lat), (2, 1.0 - 0.012 * a_lat)):
+            sx = np.clip(cx + (xx - cx) / scale, 0, w - 1)
+            sy = np.clip(cy + (yy - cy) / scale, 0, h - 1)
+            x0 = np.floor(sx).astype(np.int32)
+            y0 = np.floor(sy).astype(np.int32)
+            x1 = np.clip(x0 + 1, 0, w - 1)
+            y1 = np.clip(y0 + 1, 0, h - 1)
+            fx = (sx - x0)[None, :].astype(np.float32)
+            fy = (sy - y0)[:, None].astype(np.float32)
+            tables[ch] = (x0, x1, fx, y0, y1, fy)
+        if len(_CA_WARP_CACHE) > 32:
+            _CA_WARP_CACHE.pop(next(iter(_CA_WARP_CACHE)), None)
+        _CA_WARP_CACHE[key] = tables
+
+    sig_r = float(np.hypot(2.2 * a_lat, 1.0 + 3.0 * a_lon))
+    sig_g = float(np.hypot(0.35 * a_lat, 1.0 + 0.4 * a_lon))
+    sig_b = float(np.hypot(2.6 * a_lat, 1.0 + 3.4 * a_lon))
+
+    from ..core.signal import get_native_lib, get_scratch, gaussian_half_kernel
+    lib = get_native_lib()
+    if lib is not None and rgb.ndim == 3 and rgb.shape[2] == 3 and rgb.dtype == np.float32:
+        src_c = np.ascontiguousarray(rgb, dtype=np.float32)
+        x0_r, x1_r, fx_r, y0_r, y1_r, fy_r = tables[0]
+        x0_b, x1_b, fx_b, y0_b, y1_b, fy_b = tables[2]
+        fx_r1 = np.ascontiguousarray(fx_r.reshape(-1), dtype=np.float32)
+        fy_r1 = np.ascontiguousarray(fy_r.reshape(-1), dtype=np.float32)
+        fx_b1 = np.ascontiguousarray(fx_b.reshape(-1), dtype=np.float32)
+        fy_b1 = np.ascontiguousarray(fy_b.reshape(-1), dtype=np.float32)
+
+        r_w = get_scratch("ca_rw", (h, w), np.float32)
+        g_w = get_scratch("ca_gw", (h, w), np.float32)
+        b_w = get_scratch("ca_bw", (h, w), np.float32)
+        lib.vml_ca_warp_split_f32(
+            src_c.ctypes.data, r_w.ctypes.data, g_w.ctypes.data, b_w.ctypes.data,
+            x0_r.ctypes.data, x1_r.ctypes.data, fx_r1.ctypes.data,
+            y0_r.ctypes.data, y1_r.ctypes.data, fy_r1.ctypes.data,
+            x0_b.ctypes.data, x1_b.ctypes.data, fx_b1.ctypes.data,
+            y0_b.ctypes.data, y1_b.ctypes.data, fy_b1.ctypes.data,
+            h, w,
+        )
+        kh_r, rr = gaussian_half_kernel(sig_r)
+        kh_g, rg = gaussian_half_kernel(sig_g)
+        kh_b, rb = gaussian_half_kernel(sig_b)
+        tmp_r = get_scratch("ca_tr", (h, w), np.float32)
+        tmp_g = get_scratch("ca_tg", (h, w), np.float32)
+        tmp_b = get_scratch("ca_tb", (h, w), np.float32)
+        lib.vml_sym_fir_horiz_f32(r_w.ctypes.data, tmp_r.ctypes.data, kh_r.ctypes.data, rr, h, w, 1)
+        lib.vml_sym_fir_horiz_f32(g_w.ctypes.data, tmp_g.ctypes.data, kh_g.ctypes.data, rg, h, w, 1)
+        lib.vml_sym_fir_horiz_f32(b_w.ctypes.data, tmp_b.ctypes.data, kh_b.ctypes.data, rb, h, w, 1)
+        out = np.empty_like(src_c)
+        lib.vml_ca_vert_merge_f32(
+            tmp_r.ctypes.data, kh_r.ctypes.data, rr,
+            tmp_g.ctypes.data, kh_g.ctypes.data, rg,
+            tmp_b.ctypes.data, kh_b.ctypes.data, rb,
+            out.ctypes.data, h, w,
+        )
+        return out
+
+    try:
+        import cv2 as _cv2
+        r0, g0, b0 = _cv2.split(np.ascontiguousarray(rgb, dtype=np.float32))
+        planes = {0: r0, 1: g0, 2: b0}
+        _have_cv = True
+    except Exception:
+        planes = {0: rgb[..., 0], 1: rgb[..., 1], 2: rgb[..., 2]}
+        _have_cv = False
+
+    warped: dict[int, np.ndarray] = {}
+    for ch in (0, 2):
+        x0, x1, fx, y0, y1, fy = tables[ch]
+        plane = planes[ch]
+        row_y = plane[y0] + (plane[y1] - plane[y0]) * fy
+        c0 = row_y[:, x0]
+        c1 = row_y[:, x1]
+        c1 -= c0
+        c1 *= fx
+        c1 += c0
+        warped[ch] = c1
+    r = lowpass(warped[0], sig_r)
+    b = lowpass(warped[2], sig_b)
+    g = lowpass(planes[1], sig_g)
+    if _have_cv:
+        return _cv2.merge((r, g, b))
     return np.stack([r, g, b], axis=-1).astype(np.float32, copy=False)
 
 
@@ -531,6 +671,22 @@ def optical_wt_zoom(rgb: np.ndarray, zoom_pos: float, max_zoom: float = 4.0,
     return np.clip(out, 0.0, 2.0).astype(np.float32), mag
 
 
+def _pow13_f32(x: np.ndarray) -> np.ndarray:
+    return x * (np.float32(0.218) + x * (np.float32(0.952) - np.float32(0.170) * x))
+
+
+def _pow135_f32(x: np.ndarray) -> np.ndarray:
+    return x * (np.float32(0.185) + x * (np.float32(1.005) - np.float32(0.190) * x))
+
+
+def _pow15_f32(x: np.ndarray) -> np.ndarray:
+    return x * np.sqrt(x)
+
+
+def _pow16_f32(x: np.ndarray) -> np.ndarray:
+    return x * (np.float32(0.065) + x * (np.float32(1.215) - np.float32(0.280) * x))
+
+
 def asymmetric_ccd_smear_and_trench(
     rgb: np.ndarray,
     smear_amount: float,
@@ -539,36 +695,170 @@ def asymmetric_ccd_smear_and_trench(
 ) -> np.ndarray:
     """
     Physical SONY DCR-TRV310E Up-Down Asymmetric Interline CCD Vertical Smear + Flanking VOD/HOD Dark Trenches.
-
-    Calibrated against `328073600181017743.jpeg`, `4081604481662954477.jpeg`, and `862831116-1416402190.jpeg`:
-      1. **Strong Up-Down Asymmetry (`dy > 0` downward vs `dy < 0` upward)**:
-         During vertical interline transfer, the vertical shift register clocks charge packets downward across the
-         overloaded photosite:
-           - **Downward (`dy > 0`, below the light source)**: A flared core-neck funnel transitions into a
-             razor-sharp (`1-2.5 px` wide), intense vertical needle extending to the bottom of the frame, with a
-             bright cyan-blue/white spine (`B >= G > R`) and subtle 2-row interlaced scanline beading.
-           - **Upward (`dy < 0`, above the light source)**: Pre-transfer leakage forms a significantly weaker
-             (`~0.34x`), wider (`sigma_x ~ 2.1 px`), and faster-decaying upward plume.
-      2. **Flanking Dark VOD/HOD Anti-Blooming Trenches (`垂直溢出亮线两侧的伴随暗槽`)**:
-         Immediately adjacent horizontally to the vertical smear spike (`|dx| ~ 1.5..5.0 px`, stronger on the right
-         side `dx > 0` due to horizontal clamp recovery), the vertical overflow drain (VOD) pulls the neighboring
-         columns below the surrounding background luminance (`-0.06` to `-0.26` on lit road/building backgrounds).
     """
     a = float(np.clip(smear_amount, 0.0, 2.0))
     if a <= 1e-4:
         return rgb
 
-    from scipy.ndimage import convolve1d, gaussian_filter
+    from scipy.fft import rfft as _sp_rfft, irfft as _sp_irfft, next_fast_len as _next_fast_len
+    try:
+        import cv2 as _cv2
+        _have_cv = True
+    except Exception:
+        _cv2 = None
+        _have_cv = False
 
     h, w = rgb.shape[:2]
     sc = min(h, w) / 540.0
-    src = np.clip(np.asarray(rgb, np.float32), 0.0, 2.0)
+    src = np.asarray(rgb, np.float32)
+
+    if _have_cv and h >= 240 and w >= 240:
+        ds_y = 4 if h >= 400 else (2 if h >= 240 else 1)
+        ds_x = 2 if w >= 600 else 1
+        h_ds = max(8, (h + ds_y - 1) // ds_y)
+        w_ds = max(8, (w + ds_x - 1) // ds_x)
+        sc_y = sc / ds_y
+        sc_x = sc / ds_x
+        src_ds = np.clip(_cv2.resize(src, (w_ds, h_ds), interpolation=_cv2.INTER_AREA), 0.0, 2.0) if (ds_y > 1 or ds_x > 1) else np.clip(src, 0.0, 2.0)
+        lum_ds = src_ds @ LUMA
+
+        hot_area_frac = float(np.mean(lum_ds > 0.68))
+        broad_damp = 1.0
+        if hot_area_frac > 0.030:
+            broad_damp = 1.0 / (1.0 + 45.0 * (hot_area_frac - 0.030))
+            if a * broad_damp <= 1e-4:
+                return rgb
+
+        small_lum = _cv2.resize(lum_ds, (max(2, w_ds // 4), max(2, h_ds // 2)), interpolation=_cv2.INTER_AREA)
+        bg_lum_ds = _cv2.resize(lowpass(small_lum, max(0.8, 14.0 * sc_x / 4.0)), (w_ds, h_ds), interpolation=_cv2.INTER_LINEAR)
+
+        peak_ds = _cv2.max(_cv2.max(src_ds[..., 0], src_ds[..., 1]), src_ds[..., 2])
+        pmax = max(float(peak_ds.max()), 1e-4)
+        rel_peak = np.clip(peak_ds * np.float32(1.0 / pmax), 0.0, 1.0)
+
+        clips = np.array([0.74, 0.80, 0.86], dtype=np.float32)[None, None, :]
+        hot_ch = np.clip(src_ds - clips, 0.0, None)
+        hot_gate = np.clip((lum_ds - np.maximum(bg_lum_ds + np.float32(0.08), np.float32(0.56))) * np.float32(1.0 / 0.24), 0.0, 1.0)
+        sat_gate = np.clip((rel_peak - np.float32(0.54)) * np.float32(1.0 / 0.32), 0.0, 1.0) * np.clip((lum_ds - bg_lum_ds * np.float32(0.62)) * np.float32(5.0), 0.0, 1.0)
+        emit_drive = _cv2.max(_pow13_f32(hot_gate), np.float32(0.82) * _pow15_f32(sat_gate))
+        if float(emit_drive.max()) <= 1e-4 and float(hot_ch.max()) <= 1e-4:
+            return rgb
+
+        if hot_area_frac > 0.030:
+            a = a * broad_damp
+            lp_y = lowpass(lowpass(lum_ds, max(0.8, 3.2 * sc_x), axis=1), max(0.5, 3.2 * sc_y), axis=0)
+            local_prom = np.clip((lum_ds - lp_y) * np.float32(1.0 / 0.16), 0.0, 1.0)
+            emit_drive = emit_drive * local_prom
+            hot_ch = hot_ch * local_prom[..., None]
+
+        z = float(np.clip(zoom_pos, 0.0, 1.0))
+        len_f = float(np.clip(length_scale, 0.15, 1.5))
+
+        emit_ds = np.maximum(hot_ch, src_ds * (_pow135_f32(emit_drive) * np.float32(0.52))[..., None])
+        emit_lum = emit_ds @ LUMA
+        col_local_max = lowpass(emit_lum, max(0.8, 3.2 * sc_x), axis=1)
+        col_pinch = _pow16_f32(np.clip((emit_lum - np.float32(0.72) * col_local_max) / np.maximum(np.float32(0.28) * col_local_max, np.float32(1e-4)), 0.0, 1.0))
+        nd_ds = emit_ds * (np.float32(0.22) + np.float32(0.78) * col_pinch)[..., None]
+
+        k_key = (int(h_ds), round(len_f, 4), round(sc_y, 4))
+        k_entry = _SMEAR_KERNEL_CACHE.get(k_key)
+        if k_entry is None:
+            r_neck = max(3, min(h_ds - 1, int(round((28.0 + 36.0 * len_f) * sc_y))))
+            m_neck = np.arange(-r_neck, r_neck + 1, dtype=np.float32)
+            tau_neck_dn = max(1.5, (12.0 + 18.0 * len_f) * sc_y)
+            tau_neck_up = max(1.0, (6.5 + 9.5 * len_f) * sc_y)
+            k_neck = np.where(m_neck >= 0.0, np.exp(-np.maximum(0.0, m_neck) / tau_neck_dn), 0.38 * np.exp(-np.maximum(0.0, -m_neck) / tau_neck_up)).astype(np.float32)
+            k_neck /= max(1e-6, float(k_neck.sum()))
+            rad_n = len(k_neck) // 2
+            nfft_n = _next_fast_len(h_ds + len(k_neck) - 1, real=True)
+            fk_n = _sp_rfft(k_neck, n=nfft_n)[:, None, None]
+
+            r_far = max(8, min(h_ds - 1, int(round(min(h_ds * 0.92, (160.0 + 260.0 * len_f) * sc_y)))))
+            m_far = np.arange(-r_far, r_far + 1, dtype=np.float32)
+            tau_far_dn = max(4.0, (75.0 + 165.0 * len_f) * sc_y)
+            tau_far_up = max(2.5, (22.0 + 42.0 * len_f) * sc_y)
+            k_far_dn = np.where(m_far > 0.0, 0.72 * np.exp(-np.maximum(0.0, m_far) / tau_far_dn) + 0.28 / (1.0 + (np.maximum(0.0, m_far) / max(2.0, 28.0 * sc_y)) ** 1.15), 0.0).astype(np.float32)
+            k_far_dn /= max(1e-6, float(k_far_dn.sum()))
+            k_far_up = np.where(m_far < 0.0, np.exp(-np.maximum(0.0, -m_far) / tau_far_up), 0.0).astype(np.float32)
+            k_far_up /= max(1e-6, float(k_far_up.sum()))
+            rad_f = len(k_far_dn) // 2
+            nfft_f = _next_fast_len(h_ds + len(k_far_dn) - 1, real=True)
+            fk_d = _sp_rfft(k_far_dn, n=nfft_f)[:, None, None]
+            fk_u = _sp_rfft(k_far_up, n=nfft_f)[:, None, None]
+            k_entry = (nfft_n, rad_n, fk_n, nfft_f, rad_f, fk_d, fk_u)
+            if len(_SMEAR_KERNEL_CACHE) > 32:
+                _SMEAR_KERNEL_CACHE.pop(next(iter(_SMEAR_KERNEL_CACHE)), None)
+            _SMEAR_KERNEL_CACHE[k_key] = k_entry
+
+        nfft_n, rad_n, fk_n, nfft_f, rad_f, fk_d, fk_u = k_entry
+        neck_sig_x = max(0.5, (2.10 - 0.55 * z) * sc_x)
+        dn_sig_x   = max(0.30, (0.65 - 0.20 * z) * sc_x)
+        up_sig_x   = max(0.6, (2.05 - 0.45 * z) * sc_x)
+
+        fa_n = _sp_rfft(emit_ds, n=nfft_n, axis=0, workers=2)
+        fa_n *= fk_n
+        v_neck_ds = lowpass(_sp_irfft(fa_n, n=nfft_n, axis=0, workers=2, overwrite_x=True)[rad_n : rad_n + h_ds].astype(np.float32, copy=False), neck_sig_x, axis=1)
+
+        fa_f = _sp_rfft(nd_ds, n=nfft_f, axis=0, workers=2)
+        v_down_ds = lowpass(_sp_irfft(fa_f * fk_d, n=nfft_f, axis=0, workers=2, overwrite_x=True)[rad_f : rad_f + h_ds].astype(np.float32, copy=False), dn_sig_x, axis=1)
+        fa_f *= fk_u
+        v_up_ds   = lowpass(_sp_irfft(fa_f, n=nfft_f, axis=0, workers=2, overwrite_x=True)[rad_f : rad_f + h_ds].astype(np.float32, copy=False), up_sig_x, axis=1)
+
+        core_shield_ds = np.clip(lowpass(emit_drive, max(0.6, 2.5 * sc_x), axis=1) * np.float32(2.4), 0.0, 1.0)
+        spine_lum_ds = (v_down_ds @ LUMA) + np.float32(0.25) * (v_up_ds @ LUMA)
+        lat_narrow = lowpass(spine_lum_ds, max(0.30, 0.55 * sc_x), axis=1)
+        lat_wide   = lowpass(spine_lum_ds, max(0.80, 3.10 * sc_x), axis=1)
+        shift_r = max(1, int(round(2.6 * sc_x)))
+        lat_right = np.roll(lowpass(spine_lum_ds, max(0.60, 1.95 * sc_x), axis=1), shift_r, axis=1)
+        lat_right[:, :shift_r] = 0.0
+        spine_peak_col = np.maximum(lat_narrow, lowpass(v_neck_ds @ LUMA, max(0.4, 1.1 * sc_x), axis=1) * np.float32(0.55))
+        trench_raw = np.clip(np.float32(0.55) * lat_wide + np.float32(0.92) * lat_right - np.float32(1.55) * spine_peak_col, 0.0, None)
+        _sp_flat = spine_lum_ds.ravel()
+        _k99 = min(_sp_flat.size - 1, max(0, int(round(0.992 * (_sp_flat.size - 1)))))
+        spine_p99 = max(float(np.partition(_sp_flat, _k99)[_k99]), 1e-4)
+        trench_norm_ds = np.clip(trench_raw * np.float32(1.0 / (0.22 * spine_p99)), 0.0, 1.0) * (np.float32(1.0) - core_shield_ds)
+
+        neck_tint = np.array([0.96, 1.02, 1.18], dtype=np.float32)[None, None, :]
+        dn_tint   = np.array([0.74, 1.06, 1.46], dtype=np.float32)[None, None, :]
+        up_tint   = np.array([0.72, 0.98, 1.28], dtype=np.float32)[None, None, :]
+
+        trench_gate_ds = np.clip(np.float32(1.0) - np.float32(2.2) * trench_norm_ds, 0.15, 1.0)[..., None]
+        tot_streak_ds = (
+            np.float32(0.95 * a) * v_neck_ds * neck_tint
+            + np.float32(1.85 * a) * v_down_ds * dn_tint
+            + np.float32(0.42 * a) * v_up_ds * up_tint
+        ) * trench_gate_ds
+        trench_atten_ds = np.clip(np.float32(a * 0.52) * trench_norm_ds, 0.0, 0.52)
+
+        from ..core.signal import get_native_lib
+        lib = get_native_lib()
+        if lib is not None and src.ndim == 3 and src.shape[2] == 3:
+            src_c = np.ascontiguousarray(src, dtype=np.float32)
+            st_c = np.ascontiguousarray(tot_streak_ds, dtype=np.float32)
+            tr_c = np.ascontiguousarray(trench_atten_ds, dtype=np.float32)
+            out = np.empty_like(src_c)
+            lib.vml_smear_upsample_blend_f32(
+                src_c.ctypes.data, st_c.ctypes.data, tr_c.ctypes.data,
+                out.ctypes.data, h, w, h_ds, w_ds,
+            )
+            return out
+
+        if ds_y > 1 or ds_x > 1:
+            v_streak = _cv2.resize(tot_streak_ds, (w, h), interpolation=_cv2.INTER_LINEAR)
+            trench_atten = _cv2.resize(trench_atten_ds, (w, h), interpolation=_cv2.INTER_LINEAR)[..., None]
+        else:
+            v_streak, trench_atten = tot_streak_ds, trench_atten_ds[..., None]
+
+        v_streak[0::2] *= np.float32(1.045)
+        v_streak[1::2] *= np.float32(0.955)
+        out = np.clip(src, 0.0, 2.0) * (np.float32(1.0) - trench_atten) + v_streak
+        np.clip(out, 0.0, 2.0, out=out)
+        return out.astype(np.float32, copy=False)
+
     lum = src @ LUMA
     bg_lum = lowpass(lum, max(2.0, 14.0 * sc))
     pmax = max(float(src.max()), 1e-4)
     rel_peak = np.clip(src.max(axis=-1) / pmax, 0.0, 1.0)
-
-    # Per-channel well saturation thresholds (R saturates earliest, then G, then B)
     clips = np.array([0.74, 0.80, 0.86], dtype=np.float32)[None, None, :]
     hot_ch = np.clip(src - clips, 0.0, None)
     hot_gate = np.clip((lum - np.maximum(bg_lum + 0.08, 0.56)) / 0.24, 0.0, 1.0)
@@ -576,135 +866,57 @@ def asymmetric_ccd_smear_and_trench(
     emit_drive = np.maximum(hot_gate ** 1.3, 0.82 * (sat_gate ** 1.5))
     if float(emit_drive.max()) <= 1e-4 and float(hot_ch.max()) <= 1e-4:
         return rgb
-
-    # Distinguish compact point emitters (night streetlamps, < 3% of frame) from broad reflective
-    # surfaces (such as flash-lit silver blister packs or daylight skies covering > 3% of the frame):
     hot_area_frac = float(np.mean(lum > 0.68))
     if hot_area_frac > 0.030:
         broad_damp = 1.0 / (1.0 + 45.0 * (hot_area_frac - 0.030))
         a = a * broad_damp
         if a <= 1e-4:
             return rgb
-        # Isolate true specular pinpoints rather than broad bright foil sheets
         local_prom = np.clip((lum - lowpass(lum, max(1.2, 3.2 * sc))) / 0.16, 0.0, 1.0)
         emit_drive = emit_drive * local_prom
         hot_ch = hot_ch * local_prom[..., None]
-
     z = float(np.clip(zoom_pos, 0.0, 1.0))
     len_f = float(np.clip(length_scale, 0.15, 1.5))
-
-    # Source packet feeding the vertical shift register:
     emit_src = np.maximum(hot_ch, src * (emit_drive ** 1.35)[..., None] * 0.52)
     emit_lum = emit_src @ LUMA
     col_local_max = lowpass(emit_lum, max(1.2, 3.2 * sc), axis=1)
     col_pinch = np.clip((emit_lum - 0.72 * col_local_max) / np.maximum(0.28 * col_local_max, 1e-4), 0.0, 1.0) ** 1.6
     needle_src = emit_src * (0.22 + 0.78 * col_pinch)[..., None]
-
-    # 1. Build 1D Up-Down Asymmetric Vertical Kernels and convolve via fast 1D FFT along axis=0
     r_neck = max(6, min(h - 1, int(round((28.0 + 36.0 * len_f) * sc))))
     m_neck = np.arange(-r_neck, r_neck + 1, dtype=np.float32)
-    m_neck_pos = np.maximum(0.0, m_neck)
-    m_neck_neg = np.maximum(0.0, -m_neck)
     tau_neck_dn = max(3.0, (12.0 + 18.0 * len_f) * sc)
     tau_neck_up = max(2.0, (6.5 + 9.5 * len_f) * sc)
-    k_neck = np.where(
-        m_neck >= 0.0,
-        np.exp(-m_neck_pos / tau_neck_dn),
-        0.38 * np.exp(-m_neck_neg / tau_neck_up),
-    ).astype(np.float32)
+    k_neck = np.where(m_neck >= 0.0, np.exp(-np.maximum(0.0, m_neck) / tau_neck_dn), 0.38 * np.exp(-np.maximum(0.0, -m_neck) / tau_neck_up)).astype(np.float32)
     k_neck /= max(1e-6, float(k_neck.sum()))
-
     r_far = max(16, min(h - 1, int(round(min(h * 0.92, (160.0 + 260.0 * len_f) * sc)))))
     m_far = np.arange(-r_far, r_far + 1, dtype=np.float32)
-    m_far_pos = np.maximum(0.0, m_far)
-    m_far_neg = np.maximum(0.0, -m_far)
     tau_far_dn = max(12.0, (75.0 + 165.0 * len_f) * sc)
     tau_far_up = max(6.0, (22.0 + 42.0 * len_f) * sc)
-    k_far_dn = np.where(
-        m_far > 0.0,
-        0.72 * np.exp(-m_far_pos / tau_far_dn) + 0.28 / (1.0 + (m_far_pos / max(6.0, 28.0 * sc)) ** 1.15),
-        0.0,
-    ).astype(np.float32)
+    k_far_dn = np.where(m_far > 0.0, 0.72 * np.exp(-np.maximum(0.0, m_far) / tau_far_dn) + 0.28 / (1.0 + (np.maximum(0.0, m_far) / max(6.0, 28.0 * sc)) ** 1.15), 0.0).astype(np.float32)
     k_far_dn /= max(1e-6, float(k_far_dn.sum()))
-
-    k_far_up = np.where(
-        m_far < 0.0,
-        np.exp(-m_far_neg / tau_far_up),
-        0.0,
-    ).astype(np.float32)
+    k_far_up = np.where(m_far < 0.0, np.exp(-np.maximum(0.0, -m_far) / tau_far_up), 0.0).astype(np.float32)
     k_far_up /= max(1e-6, float(k_far_up.sum()))
-
     neck_sig_x = max(0.85, (2.10 - 0.55 * z) * sc)
     dn_sig_x   = max(0.35, (0.65 - 0.20 * z) * sc)
     up_sig_x   = max(1.15, (2.05 - 0.45 * z) * sc)
-
-    from scipy.fft import rfft as _sp_rfft, irfft as _sp_irfft
-
-    def _conv1d_axis0_fft_single(arr3: np.ndarray, k1d: np.ndarray) -> np.ndarray:
-        kh = len(k1d)
-        rad = kh // 2
-        n_fft = int(2 ** np.ceil(np.log2(max(2, h + kh - 1))))
-        fk = _sp_rfft(k1d, n=n_fft)[:, None, None]
-        col_mask = np.any(arr3 > 0.0, axis=(0, 2))
-        if not np.all(col_mask):
-            idx = np.flatnonzero(col_mask)
-            if idx.size == 0:
-                return np.zeros_like(arr3)
-            fa = _sp_rfft(arr3[:, idx, :], n=n_fft, axis=0)
-            c_sub = _sp_irfft(fa * fk, n=n_fft, axis=0)[rad:rad + h]
-            out_c = np.zeros_like(arr3)
-            out_c[:, idx, :] = c_sub
-            return out_c
-        fa = _sp_rfft(arr3, n=n_fft, axis=0)
-        return _sp_irfft(fa * fk, n=n_fft, axis=0)[rad:rad + h].astype(np.float32, copy=False)
-
-    def _conv1d_axis0_fft_pair(arr3: np.ndarray, k1: np.ndarray, k2: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-        kh = len(k1)
-        rad = kh // 2
-        n_fft = int(2 ** np.ceil(np.log2(max(2, h + kh - 1))))
-        fk1 = _sp_rfft(k1, n=n_fft)[:, None, None]
-        fk2 = _sp_rfft(k2, n=n_fft)[:, None, None]
-        col_mask = np.any(arr3 > 0.0, axis=(0, 2))
-        if not np.all(col_mask):
-            idx = np.flatnonzero(col_mask)
-            if idx.size == 0:
-                z_arr = np.zeros_like(arr3)
-                return z_arr, z_arr.copy()
-            fa = _sp_rfft(arr3[:, idx, :], n=n_fft, axis=0)
-            c1 = np.zeros_like(arr3)
-            c2 = np.zeros_like(arr3)
-            c1[:, idx, :] = _sp_irfft(fa * fk1, n=n_fft, axis=0)[rad:rad + h]
-            c2[:, idx, :] = _sp_irfft(fa * fk2, n=n_fft, axis=0)[rad:rad + h]
-            return c1, c2
-        fa = _sp_rfft(arr3, n=n_fft, axis=0)
-        c1 = _sp_irfft(fa * fk1, n=n_fft, axis=0)[rad:rad + h].astype(np.float32, copy=False)
-        c2 = _sp_irfft(fa * fk2, n=n_fft, axis=0)[rad:rad + h].astype(np.float32, copy=False)
-        return c1, c2
-
-    v_neck = lowpass(_conv1d_axis0_fft_single(emit_src, k_neck), neck_sig_x, axis=1)
-    _vd_raw, _vu_raw = _conv1d_axis0_fft_pair(needle_src, k_far_dn, k_far_up)
-    v_down = lowpass(_vd_raw, dn_sig_x, axis=1)
-    v_up   = lowpass(_vu_raw, up_sig_x, axis=1)
-
-    # Interlaced 2-row readout beading on the downward vertical shift register needle
+    n_fft_n = _next_fast_len(h + len(k_neck) - 1, real=True)
+    fk_n = _sp_rfft(k_neck, n=n_fft_n)[:, None, None]
+    fa_n = _sp_rfft(emit_src, n=n_fft_n, axis=0)
+    rad_n = len(k_neck) // 2
+    v_neck = lowpass(_sp_irfft(fa_n * fk_n, n=n_fft_n, axis=0)[rad_n:rad_n + h].astype(np.float32, copy=False), neck_sig_x, axis=1)
+    n_fft_f = _next_fast_len(h + len(k_far_dn) - 1, real=True)
+    fk_d = _sp_rfft(k_far_dn, n=n_fft_f)[:, None, None]
+    fk_u = _sp_rfft(k_far_up, n=n_fft_f)[:, None, None]
+    fa_f = _sp_rfft(needle_src, n=n_fft_f, axis=0)
+    rad_f = len(k_far_dn) // 2
+    v_down = lowpass(_sp_irfft(fa_f * fk_d, n=n_fft_f, axis=0)[rad_f:rad_f + h].astype(np.float32, copy=False), dn_sig_x, axis=1)
+    v_up   = lowpass(_sp_irfft(fa_f * fk_u, n=n_fft_f, axis=0)[rad_f:rad_f + h].astype(np.float32, copy=False), up_sig_x, axis=1)
     rows_y = np.arange(h, dtype=np.float32)[:, None, None]
     interlace_bead = (1.0 + 0.075 * np.cos(np.pi * rows_y)).astype(np.float32)
-
-    # Wavelength-dependent charge transfer tint:
-    # Downward needle has a strong cyan-blue/white spine (`B >= G > R`), neck is warm-cyan white
     neck_tint = np.array([0.96, 1.02, 1.18], dtype=np.float32)[None, None, :]
     dn_tint   = np.array([0.74, 1.06, 1.46], dtype=np.float32)[None, None, :]
     up_tint   = np.array([0.72, 0.98, 1.28], dtype=np.float32)[None, None, :]
-
-    v_streak = (
-        0.95 * v_neck * neck_tint
-        + 1.85 * v_down * dn_tint * interlace_bead
-        + 0.42 * v_up * up_tint
-    ) * a
-
-    # 2. Flanking Dark VOD/HOD Anti-Blooming Trenches (`垂直溢出亮线两侧伴随暗槽`)
-    # Immediately to the left and right of the vertical needle (stronger on the right `dx > 0`),
-    # the anti-blooming drain pulls the background below its own exposure.
+    v_streak = (0.95 * v_neck * neck_tint + 1.85 * v_down * dn_tint * interlace_bead + 0.42 * v_up * up_tint) * a
     core_shield = np.clip(lowpass(emit_drive, max(1.0, 2.5 * sc)) * 2.4, 0.0, 1.0)
     spine_lum = (v_down @ LUMA) + 0.25 * (v_up @ LUMA)
     lat_narrow = lowpass(spine_lum, max(0.35, 0.55 * sc), axis=1)
@@ -712,19 +924,14 @@ def asymmetric_ccd_smear_and_trench(
     shift_r = max(2, int(round(2.6 * sc)))
     lat_right  = np.roll(lowpass(spine_lum, max(1.10, 1.95 * sc), axis=1), shift_r, axis=1)
     lat_right[:, :shift_r] = 0.0
-
-    # Gate out the center of the needle so the bright spine stays bright while its flanks dip below background
     spine_peak_col = np.maximum(lat_narrow, lowpass(v_neck @ LUMA, max(0.6, 1.1 * sc), axis=1) * 0.55)
     trench_raw = np.clip(0.55 * lat_wide + 0.92 * lat_right - 1.55 * spine_peak_col, 0.0, None)
     spine_p99 = max(float(np.percentile(spine_lum, 99.2)), 1e-4)
     trench_norm = np.clip(trench_raw / (0.22 * spine_p99), 0.0, 1.0) * (1.0 - core_shield)
     trench_atten = np.clip(a * 0.52 * trench_norm, 0.0, 0.52)[..., None]
-
-    # Suppress broad neck spillage inside the flanking trench so the dark groove cuts cleanly into the background
     trench_gate = np.clip(1.0 - 2.2 * trench_norm, 0.15, 1.0)[..., None]
     out = src * (1.0 - trench_atten) + v_streak * trench_gate
     return np.clip(out, 0.0, 2.0).astype(np.float32)
-
 
 def light_streaks(rgb: np.ndarray, amount: float, angle_deg: float = 0.0,
                   length: float = 0.55, zoom_pos: float = 0.0) -> np.ndarray:

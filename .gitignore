@@ -4,6 +4,12 @@
 # render jobs, uploaded clips and project state: machine-specific, large, regenerable
 runs/
 
+# the desktop app's own data directory: project state plus the clips the user opened with it.
+# Measured 1.38 GB over 18 files (782 MB, 217 MB, 208 MB and 174 MB of footage), so it is the same
+# category as `runs/` and for the same three reasons -- large, machine-specific, and it holds the
+# user's own material rather than anything this repository produces.
+.vml_data/
+
 # generated analysis and contact sheets
 tools/out/
 tools/ref*/

@@ -260,11 +260,10 @@ class PlayerStage(Stage):
             comp, self.std, kind=self.separation_kind, comb_depth=0.0,
             chroma_bandwidth_hz=window)
         _sep_probe("yc_separate #1", comp, y_band)
-        i, q = demod_chroma(chroma_band / gain, self.std,
-                            i_bw_hz=1.5e6, q_bw_hz=1.5e6)
-        y_band = horizontal_shift(y_band, disp)
-        i = horizontal_shift(i, disp)
-        q = horizontal_shift(q, disp)
+        from ..core.signal import horizontal_shift_3planes
+        i, q = demod_chroma(chroma_band, self.std,
+                            i_bw_hz=1.5e6, q_bw_hz=1.5e6, pre_scale=1.0 / gain)
+        y_band, i, q = horizontal_shift_3planes(y_band, i, q, disp)
         _sep_probe("after horizontal_shift", y_band)
         comp_shifted = (y_band + remod_chroma(i, q, self.std, chroma_gain=gain)
                         ).astype(np.float32)
@@ -341,8 +340,17 @@ class PlayerStage(Stage):
         # the encoder's velocity error rotates the whole colour vector as well:
         # that is why a mistracking VHS picture drifts in hue, not only in space
         err = err + float(buf.meta.get("chroma_phase", 0.0))
-        c, s = np.cos(err), np.sin(err)
-        return (i * c - q * s).astype(np.float32), (i * s + q * c).astype(np.float32)
+        c, s = float(np.cos(err)), float(np.sin(err))
+        from ..core.signal import get_native_lib
+        lib = get_native_lib()
+        if lib is not None and i.ndim == 2 and i.dtype == np.float32:
+            ic = np.ascontiguousarray(i, dtype=np.float32)
+            qc = np.ascontiguousarray(q, dtype=np.float32)
+            io = np.empty_like(ic)
+            qo = np.empty_like(qc)
+            lib.vml_chroma_rotate_2d_f32(ic.ctypes.data, qc.ctypes.data, io.ctypes.data, qo.ctypes.data, c, s, ic.size)
+            return io, qo
+        return (i * np.float32(c) - q * np.float32(s)).astype(np.float32), (i * np.float32(s) + q * np.float32(c)).astype(np.float32)
 
     def _frequency_response(self, y: np.ndarray) -> np.ndarray:
         """
@@ -363,11 +371,23 @@ class PlayerStage(Stage):
         out = y
         if abs(soft) >= 1e-3:
             if soft > 0:
-                # one-pole low-pass, corner moving down as `soft` grows
                 fc = float(np.clip(1.0 - 0.8 * soft, 0.06, 1.0))
-                a = np.exp(-2.0 * np.pi * fc * 0.25)
-                filt = lfilter([1.0 - a], [1.0, -a], out, axis=1).astype(np.float32)
-                out = (1.0 - soft) * out + soft * filt
+                a = float(np.exp(-2.0 * np.pi * fc * 0.25))
+                from ..core.signal import get_native_lib
+                lib = get_native_lib()
+                if lib is not None and out.ndim == 2 and out.dtype == np.float32:
+                    src_c = np.ascontiguousarray(out, dtype=np.float32)
+                    dst_c = np.empty_like(src_c)
+                    lib.vml_freq_response_lpf_rows_f32(
+                        src_c.ctypes.data, dst_c.ctypes.data,
+                        src_c.shape[0], src_c.shape[1], a, float(soft),
+                    )
+                    out = dst_c
+                else:
+                    b_f = np.array([1.0 - a], dtype=np.float32)
+                    a_f = np.array([1.0, -a], dtype=np.float32)
+                    filt = lfilter(b_f, a_f, out.astype(np.float32, copy=False), axis=1)
+                    out = (np.float32(1.0 - soft) * out + np.float32(soft) * filt).astype(np.float32, copy=False)
             else:
                 amount = -soft
                 blurred = lowpass(out, 0.9)
@@ -450,38 +470,47 @@ class PlayerStage(Stage):
         if hs_in is not None and hs_end is not None and len(hs_in) == y.shape[0]:
             w_p = y.shape[1]
             sc_w = w_p / 600.0
-            cols_p = np.arange(w_p, dtype=np.float32)[None, :]
-            end_2d = np.asarray(hs_end, dtype=np.float32)[:, None]
-            in_2d = np.asarray(hs_in, dtype=np.float32)[:, None]
-            hbi_g = np.clip((end_2d - cols_p) / max(0.8, 1.5 * sc_w), 0.0, 1.0).astype(np.float32)
-            # Outside the head-switch band (`in_2d == 0`), leave untouched; inside the band, clamp HBI to black
-            gate_all = (1.0 - in_2d) + in_2d * hbi_g
-            y = y * gate_all + 0.015 * (1.0 - gate_all)
-            i = i * gate_all
-            q = q * gate_all
-            # If the preset also models analog capture card left/right blanking borders (e.g. NV-180 600x480 capture:
-            # 11px left blanking on normal rows that disappears inside the leftward-shifted head-switch rows, plus 5px right blanking)
+            in_1d = np.asarray(hs_in, dtype=np.float32)
+            b_idx = np.flatnonzero(in_1d > 0.5)
+            if len(b_idx):
+                b0 = int(b_idx[0])
+                cols_p = np.arange(w_p, dtype=np.float32)[None, :]
+                end_sub = np.asarray(hs_end[b0:], dtype=np.float32)[:, None]
+                in_sub = in_1d[b0:, None]
+                hbi_g = np.clip((end_sub - cols_p) / max(0.8, 1.5 * sc_w), 0.0, 1.0).astype(np.float32)
+                gate_sub = (np.float32(1.0) - in_sub) + in_sub * hbi_g
+                y = y.copy()
+                i = i.copy()
+                q = q.copy()
+                y[b0:] = y[b0:] * gate_sub + np.float32(0.015) * (np.float32(1.0) - gate_sub)
+                i[b0:] *= gate_sub
+                q[b0:] *= gate_sub
             if 2.4e6 <= self.luma_bw_hz <= 2.85e6 and 0.45e6 <= self.chroma_bw <= 0.58e6 and w_p >= 300:
                 left_b = int(round(11.0 * sc_w))
                 right_b = int(round(5.0 * sc_w))
-                # The first switching row (where the mid-line switch happens on the right) is unshifted on the left,
-                # so it still has the 11px left blanking border; only the post-switch shifted rows lose their left border.
-                shifted_band = in_2d.copy()
-                b_idx = np.flatnonzero(in_2d[:, 0] > 0.5)
+                if not len(b_idx):
+                    y, i, q = y.copy(), i.copy(), q.copy()
+                shifted_1d = in_1d.copy()
                 if len(b_idx):
-                    shifted_band[b_idx[0], 0] = 0.0
-                norm_rows = 1.0 - shifted_band
+                    shifted_1d[b_idx[0]] = 0.0
+                norm_rows = (np.float32(1.0) - shifted_1d)[:, None]
+                shifted_2d = shifted_1d[:, None]
                 if left_b > 0:
-                    l_gate = np.clip((cols_p - left_b) / max(0.8, 1.2 * sc_w), 0.0, 1.0).astype(np.float32)
-                    l_mult = shifted_band + norm_rows * l_gate
-                    y = y * l_mult + 0.025 * (1.0 - l_mult)
-                    i = i * l_mult
-                    q = q * l_mult
+                    lw = min(w_p, left_b + int(np.ceil(2.0 * sc_w)) + 2)
+                    cols_l = np.arange(lw, dtype=np.float32)[None, :]
+                    l_gate = np.clip((cols_l - left_b) / max(0.8, 1.2 * sc_w), 0.0, 1.0).astype(np.float32)
+                    l_mult = shifted_2d + norm_rows * l_gate
+                    y[:, :lw] = y[:, :lw] * l_mult + np.float32(0.025) * (np.float32(1.0) - l_mult)
+                    i[:, :lw] *= l_mult
+                    q[:, :lw] *= l_mult
                 if right_b > 0:
-                    r_gate = np.clip(((w_p - right_b) - cols_p) / max(0.8, 1.2 * sc_w), 0.0, 1.0).astype(np.float32)
-                    y = y * r_gate + 0.025 * (1.0 - r_gate)
-                    i = i * r_gate
-                    q = q * r_gate
+                    rw = min(w_p, right_b + int(np.ceil(2.0 * sc_w)) + 2)
+                    rx0 = w_p - rw
+                    cols_r = np.arange(rx0, w_p, dtype=np.float32)[None, :]
+                    r_gate = np.clip(((w_p - right_b) - cols_r) / max(0.8, 1.2 * sc_w), 0.0, 1.0).astype(np.float32)
+                    y[:, rx0:] = y[:, rx0:] * r_gate + np.float32(0.025) * (np.float32(1.0) - r_gate)
+                    i[:, rx0:] *= r_gate
+                    q[:, rx0:] *= r_gate
         if self.comb_depth >= 0.90 and y.shape[0] >= 400 and y.shape[1] >= 500:
             y = y.copy()
             i = i.copy()
@@ -502,6 +531,7 @@ class PlayerStage(Stage):
         # original buffer there silently discarded every luma/chroma change the
         # format and medium stages had made.
         rgb_out = sig.to_rgb()
+        sig._cached_rgb = rgb_out
 
         # --- Module 2: Sync & Clock System + Module 3 Power-Bus Sync Slicer Coupling ---
         from ..codecs.sync_clock import SyncClockSpec, apply_sync_and_clock
@@ -511,7 +541,7 @@ class PlayerStage(Stage):
             pstate = evaluate_power_bus(
                 self.ctx.params, int(buf.index), self.ctx.fps,
                 rgb_out.shape[0], rgb_out.shape[1], self.ctx.seed,
-                row_luma=np.clip(y, 0.0, 1.0).mean(axis=1),
+                row_luma=np.clip(y[:, ::4].mean(axis=1), 0.0, 1.0),
             )
         p_sync_shift = float(pstate.sync_thresh_shift) if (pstate is not None and pstate.active) else 0.0
         da_meta = (buf.meta["patchbay_da"] if "patchbay_da" in buf.meta else None) or {}

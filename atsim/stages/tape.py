@@ -548,8 +548,7 @@ class TapeStage(Stage):
         """
         profile = self.plan.clog_rows
         if profile.size == 0 or not np.any(profile > 0.0):
-            empty = np.zeros(y.shape, dtype=np.float32)
-            return y, i, q, empty
+            return y, i, q, None
         # per-frame strength variation: slow, so the band breathes rather than
         # flickering every frame
         wobble = 0.75 + 0.45 * float(np.sin(frame_index * 0.21 + profile.sum()))
@@ -909,8 +908,9 @@ class TapeStage(Stage):
         # 1.5 MHz window the recovered I came out 2.7x too large), whereas a
         # narrow de-modulator would shave the colour detail the format layer
         # already decided on.
-        i, q = demod_chroma(chroma_band / CHROMA_CARRIER_GAIN, self.ctx.std,
-                            i_bw_hz=1.5e6, q_bw_hz=1.5e6)
+        i, q = demod_chroma(chroma_band, self.ctx.std,
+                            i_bw_hz=1.5e6, q_bw_hz=1.5e6,
+                            pre_scale=1.0 / CHROMA_CARRIER_GAIN)
         return y_band, i, q
 
     def _carrier_window_hz(self) -> float:
@@ -1093,7 +1093,7 @@ class TapeStage(Stage):
         # calibrated, not guessed -- a real deck's corrector cuts the per-row spread
         # about 8.8x, which requires the shared term to carry roughly 89% of the
         # variance, so the shared weight has to be about 2.9x the shape weight.
-        shared = float(np.asarray(self._walk_offset.sample(frame_index)).reshape(-1)[0])
+        shared = float(self._walk_offset.sample_origin(frame_index)) if hasattr(self._walk_offset, "sample_origin") else float(np.asarray(self._walk_offset.sample(frame_index)).reshape(-1)[0])
         field = (smooth + 0.7 * drift.astype(np.float32) * walk) * (amt * 2.4)
         return (field + (shared * amt * 9.0)).astype(np.float32)
 
@@ -1119,86 +1119,45 @@ class TapeStage(Stage):
         phase = phase + extra
         if not np.any(np.abs(phase) > 1e-4):
             return y, i, q
-        return (horizontal_shift(y, phase), horizontal_shift(i, phase),
-                horizontal_shift(q, phase))
+        from ..core.signal import horizontal_shift_3planes
+        return horizontal_shift_3planes(y, i, q, phase)
 
     def _head_switch(self, y: np.ndarray, i: np.ndarray, q: np.ndarray,
                      frame_index: int, rng: np.random.Generator
-                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+                     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray | None]:
         """
         The head-switching band at the bottom of the picture.
-
-        This is the thin strip real VHS shows at the bottom edge, and its shape
-        matters more than its strength:
-
-        * The two video heads swap over at the *end of each field*, so the
-          damaged rows are the last `head_switch_lines` of each field.  In a
-          woven frame those two runs both land in the bottom
-          `2*head_switch_lines` rows, which is why the artefact reads as one
-          strip along the bottom edge (measured: at 12 lines the damaged rows are
-          228-239 and 468-479 of 480).
-        * It is a *band*, not a gradient: the servo loses lock at a specific
-          point in the sweep.  An earlier version tapered the noise in smoothly,
-          which produced a soft dark smear in the middle of the frame instead of
-          a crisp edge at the bottom.
-        * The whole band is displaced horizontally by the tracking error, and
-          only part of it by the full amount -- the drift accumulates through the
-          band while the servo pulls back in, which is what gives the strip its
-          slanted, "creeping" appearance rather than a clean rectangular tear.
+        Operates strictly on the bottom affected rows [band_start_row:H] rather than the full frame.
         """
         plan = self.plan
-        H = y.shape[0]
-        empty = np.zeros((H, y.shape[1]), dtype=np.float32)
+        H, W = y.shape
         if self.hs_lines <= 0 or plan.prepared_frames <= frame_index:
-            return y, i, q, empty
+            return y, i, q, None
         amp = float(plan.head_switch_amp[frame_index])
         if amp <= 1e-4:
-            return y, i, q, empty
+            return y, i, q, None
         band = min(self.hs_lines, max(1, H // 2))
+        band_start_row = max(0, H - (2 * band - 1))
+        if band_start_row >= H:
+            return y, i, q, None
 
-        rows = np.arange(H)
-        field = rows % 2
-        within = (rows - field) // 2
-        field_len = max(1, H // 2)
-        dist_from_end = (field_len - 1) - within
-        # a crisp band: full damage in the last `band` rows of each field
-        in_band = (dist_from_end < band) & (dist_from_end >= 0)
-        if not np.any(in_band):
-            return y, i, q, empty
-        # depth ramps across the band so the edge at the picture boundary is
-        # hard while the inner edge fades -- that is what a swept head looks like
-        depth = np.clip((band - dist_from_end) / max(1.0, band), 0.0, 1.0)
-        w = (amp * depth * in_band).astype(np.float32)[:, None]
-
-        noise = self._luma_band_noise(rng, y.shape)
-        W = y.shape[1]
+        # Only generate band-limited switching noise on the bottom band rows (e.g. 7 rows instead of 1080 rows)
+        bh = H - band_start_row
+        noise_sub = self._luma_band_noise(rng, (bh, W))
         scale_w = W / 600.0
         cols = np.arange(W, dtype=np.float32)[None, :]
 
-        # --- 1. Physical Helical-Scan Head-Switch Track Handover & H-AFC PLL Recovery ---
-        # In VHS helical scan (SMPTE 170M / IEC 60774-1), the two video heads (180 deg apart on the drum
-        # with ~186 deg tape wrap overlap) switch at ~6.5 H before V-sync.
-        # Three distinct physical zones occur at the bottom of the frame:
-        #   (A) 1-2 Line RF Switching Seam (`r_rel == 0..1`): where the rotary transformer RF flip-flop
-        #       switches from Head A to Head B, creating a thin FM limiter phase-discontinuity seam and
-        #       a 1H delay-line comb burst-phase cancellation ONLY on the 1-2 lines straddling the switch.
-        #   (B) Exponential H-AFC PLL Phase Pull-In (`r_rel >= 1`): tape tension/dihedral skew (tau_hs)
-        #       causes the first H-sync pulse from the incoming head to arrive shifted by Delta_x0.
-        #       The receiver's Horizontal AFC phase-locked loop pulls the line phase exponentially back
-        #       toward zero (`exp(-(r_rel - 1) / tau_afc)`), producing a curved hook/skew at the seam
-        #       rather than translating the entire bottom band as a rigid rectangular block.
-        #   (C) Post-Switch Overlap Picture Retention & Shift-Proportional HBI Edge: below the 1-2 seam
-        #       lines, the newly engaged head reads the valid overlap track so active luma and chroma
-        #       are preserved, and the exposed right-hand HBI blanking porch is strictly proportional
-        #       to each line's actual leftward displacement.
-        drift = float(self.tracking_error)
-        step_eff = float(np.clip(0.55 * amp + 0.85 * drift, 0.0, 1.8))
+        rows_all = np.arange(H)
+        in_band_all = rows_all >= band_start_row
 
-        band_start_row = max(0, H - (2 * band - 1))
-        in_band = rows >= band_start_row
-        r_rel = np.maximum(0, rows - band_start_row).astype(np.float32)
+        rows_sub = np.arange(band_start_row, H, dtype=np.int32)
+        field_sub = rows_sub % 2
+        r_rel = (rows_sub - band_start_row).astype(np.float32)
         span_rows = max(1.0, float(H - 1 - band_start_row))
         s_norm = np.clip(r_rel / span_rows, 0.0, 1.0).astype(np.float32)
+
+        drift = float(self.tracking_error)
+        step_eff = float(np.clip(0.55 * amp + 0.85 * drift, 0.0, 1.8))
 
         try:
             _fmt_cfg = self.ctx.layer("format")
@@ -1209,8 +1168,6 @@ class TapeStage(Stage):
         is_nv180_capture = (band == 4 and 2.4 <= _luma_bw <= 2.85 and 0.45 <= _chroma_bw <= 0.58)
 
         if is_nv180_capture:
-            # 1986 Panasonic NV-180 portable backpack VCR capture (`10月16日.mp4`) calibration:
-            # Unbuffered 7-row bottom handover with wide diurnal skew step (32..49 px right HBI).
             pll_env = np.where(
                 r_rel < 0.5,
                 0.0,
@@ -1220,8 +1177,8 @@ class TapeStage(Stage):
                     np.clip(1.16 - 0.42 * s_norm, 0.76, 1.06),
                 ),
             ).astype(np.float32)
-            wobble = (2.5 * step_eff * np.sin(frame_index * 0.73 + rows * 0.11) * (r_rel >= 1.0)).astype(np.float32)
-            shift_px = (-(36.0 * scale_w * step_eff * pll_env + wobble) * in_band).astype(np.float32)
+            wobble = (2.5 * step_eff * np.sin(frame_index * 0.73 + rows_sub * 0.11) * (r_rel >= 1.0)).astype(np.float32)
+            shift_px_sub = (-(36.0 * scale_w * step_eff * pll_env + wobble)).astype(np.float32)
             step_norm = float(np.clip(step_eff / 0.85, 0.35, 1.15))
             r_black_px = np.where(
                 r_rel < 0.5,
@@ -1240,93 +1197,77 @@ class TapeStage(Stage):
                     ),
                 ),
             ).astype(np.float32)
-            c_keep_1d = (1.0 - np.clip(amp * (0.15 + 0.75 * (s_norm ** 1.3)), 0.0, 0.96))
+            c_keep_1d = (1.0 - np.clip(amp * (0.15 + 0.75 * (s_norm ** 1.3)), 0.0, 0.96)).astype(np.float32)
         else:
-            # Standard VHS Helical-Scan + H-AFC PLL Exponential Pull-In + Mid-Line RF Switch Transient
-            # (Calibrated against Early Hong Kong VHS Commercial `29ebaf66b0fc1bd0f9ab276e5e969169.mp4`):
-            #   1. Peak horizontal displacement occurs right at the head-switch seam (`r_rel == 0..2`,
-            #      measured mean 7.92 px, p90 18.0 px on `bot-2`) and decays downward toward the bottom
-            #      row (`bot-1`: 5.14 px, `bot-0`: 4.45 px) as the H-AFC loop pulls back into lock.
-            #   2. Even and odd fields switch at slightly different drum phases and carry an interlaced
-            #      comb sawtooth (`comb_step`) between adjacent woven scanlines.
-            #   3. On the switching seam lines (`r_rel < 2.0`), the rotary transformer flips at mid-line
-            #      coordinate `sw_x_row`: before `sw_x_row` the outgoing head is still reading undisturbed,
-            #      right at `sw_x_row` the FM limiter produces a sharp white+black bipolar impulse dash,
-            #      and after `sw_x_row` the incoming head shifts horizontally by `shift_px`.
-            #   4. Post-switch rows preserve active picture content while the 629 kHz colour-under phase
-            #      step across the 1H delay-line comb produces a characteristic olive/yellow-green APC tint.
             tau_afc = max(2.2, min(5.5, 0.38 * span_rows))
-            exp_pull = np.exp(-np.maximum(0.0, r_rel - 1.0) / tau_afc)
+            exp_pull = np.exp(-np.maximum(0.0, r_rel - 1.0) / tau_afc).astype(np.float32)
             pll_env = np.where(
                 r_rel < 0.5,
                 0.72,
                 0.82 * exp_pull + 0.18 * np.exp(-np.maximum(0.0, r_rel - 1.0) / max(7.0, span_rows * 1.1)),
             ).astype(np.float32)
-
-            # Interlaced field-comb sawtooth between Head A (even rows) and Head B (odd rows)
-            comb_sign = np.where(field == 0, 1.0, -0.62).astype(np.float32)
+            comb_sign = np.where(field_sub == 0, 1.0, -0.62).astype(np.float32)
             comb_step = (2.6 * amp + 4.2 * drift) * scale_w * comb_sign * exp_pull
             peak_px = (9.2 * amp + 15.8 * drift) * scale_w
-            wobble = (1.45 * step_eff * scale_w * np.sin(frame_index * 0.73 + rows * 0.19) * exp_pull).astype(np.float32)
-            shift_px = (-((peak_px * pll_env + comb_step + wobble)) * in_band).astype(np.float32)
-
+            wobble = (1.45 * step_eff * scale_w * np.sin(frame_index * 0.73 + rows_sub * 0.19) * exp_pull).astype(np.float32)
+            shift_px_sub = (-(peak_px * pll_env + comb_step + wobble)).astype(np.float32)
             r_black_px = np.where(
                 r_rel < 0.5,
-                np.maximum(3.5 * scale_w * amp, -shift_px * 0.85),
-                np.clip(-shift_px + 1.2 * scale_w * amp, 0.0, 26.0 * scale_w),
+                np.maximum(3.5 * scale_w * amp, -shift_px_sub * 0.85),
+                np.clip(-shift_px_sub + 1.2 * scale_w * amp, 0.0, 26.0 * scale_w),
             ).astype(np.float32)
-
             seam_comb_loss = np.exp(-0.5 * ((r_rel - 0.8) / 1.05) ** 2).astype(np.float32)
-            c_keep_1d = 1.0 - np.clip(amp * (0.48 * seam_comb_loss + 0.05 * exp_pull), 0.0, 0.78)
+            c_keep_1d = (1.0 - np.clip(amp * (0.48 * seam_comb_loss + 0.05 * exp_pull), 0.0, 0.78)).astype(np.float32)
 
-        y_shifted = horizontal_shift(y, shift_px)
-        i_shifted = horizontal_shift(i, shift_px)
-        q_shifted = horizontal_shift(q, shift_px)
+        y_sub_in = y[band_start_row:]
+        i_sub_in = i[band_start_row:]
+        q_sub_in = q[band_start_row:]
+
+        y_sh_sub = horizontal_shift(y_sub_in, shift_px_sub)
+        i_sh_sub = horizontal_shift(i_sub_in, shift_px_sub)
+        q_sh_sub = horizontal_shift(q_sub_in, shift_px_sub)
 
         if is_nv180_capture:
-            y_out, i_out, q_out = y_shifted, i_shifted, q_shifted
+            y_sub, i_sub, q_sub = y_sh_sub, i_sh_sub, q_sh_sub
         else:
-            # Per-field mid-line head-switch coordinate `sw_x_row`:
-            # On the switching seam scanlines (`r_rel < 2.0`), only the portion after `sw_x_row` comes from
-            # the incoming head (`y_shifted`), creating an authentic mid-line horizontal fracture at `sw_x_row`!
             sw_f0 = 0.24 + 0.46 * (0.5 + 0.5 * float(np.sin(frame_index * 1.37 + 0.4)))
             sw_f1 = 0.35 + 0.46 * (0.5 + 0.5 * float(np.sin(frame_index * 1.37 + 1.2)))
-            sw_x_row = (float(W) * np.where(field == 0, sw_f0, sw_f1))[:, None].astype(np.float32)
+            sw_x_row = (float(W) * np.where(field_sub == 0, sw_f0, sw_f1))[:, None].astype(np.float32)
             post_sw_x = np.clip((cols - sw_x_row) / max(0.8, 1.6 * scale_w), 0.0, 1.0).astype(np.float32)
             seam_line_mask = (r_rel < 1.8)[:, None].astype(np.float32)
             head_b_gate = seam_line_mask * post_sw_x + (1.0 - seam_line_mask)
-            y_out = y * (1.0 - head_b_gate) + y_shifted * head_b_gate
-            i_out = i * (1.0 - head_b_gate) + i_shifted * head_b_gate
-            q_out = q * (1.0 - head_b_gate) + q_shifted * head_b_gate
+            y_sub = y_sub_in * (1.0 - head_b_gate) + y_sh_sub * head_b_gate
+            i_sub = i_sub_in * (1.0 - head_b_gate) + i_sh_sub * head_b_gate
+            q_sub = q_sub_in * (1.0 - head_b_gate) + q_sh_sub * head_b_gate
 
-            # Partial 1H Dropout Compensator (DOC) vertical line-hold across the switching seam
-            y_prev_field = np.roll(y_out, 2, axis=0)
-            doc_hold = (np.exp(-0.5 * ((r_rel - 0.9) / 0.95) ** 2) * in_band)[:, None].astype(np.float32) * post_sw_x * float(np.clip(amp * 0.36, 0.0, 0.48))
-            y_out = y_out * (1.0 - doc_hold) + y_prev_field * doc_hold
+            y_prev_field = np.empty_like(y_sub)
+            if band_start_row >= 2:
+                y_prev_field[:2] = y[band_start_row - 2 : band_start_row]
+                y_prev_field[2:] = y_sub[:-2]
+            else:
+                y_prev_field = np.roll(y_sub, 2, axis=0)
+            doc_hold = np.exp(-0.5 * ((r_rel - 0.9) / 0.95) ** 2)[:, None].astype(np.float32) * post_sw_x * float(np.clip(amp * 0.36, 0.0, 0.48))
+            y_sub = y_sub * (1.0 - doc_hold) + y_prev_field * doc_hold
 
-        # --- 2. Mid-line RF head-switch seam transient & right-hand HBI blanking cut ---
         vbi_cut_x = float(W) * (0.64 + 0.22 * float(np.sin(frame_index * 0.61 + 0.4)))
-        active_end = np.where(
-            (rows == H - 1) & in_band,
+        active_end_sub = np.where(
+            rows_sub == H - 1,
             np.minimum(W - r_black_px, vbi_cut_x),
             W - r_black_px,
         )[:, None].astype(np.float32)
 
-        hbi_gate = np.clip((active_end - cols) / max(0.8, 1.8 * scale_w), 0.0, 1.0).astype(np.float32)
-        sw_spike = (np.exp(-0.5 * ((cols - (active_end - 3.2 * scale_w)) / max(0.8, 1.5 * scale_w)) ** 2)
-                    * in_band[:, None].astype(np.float32) * float(np.clip(amp * 0.22, 0.0, 0.30)))
+        hbi_gate = np.clip((active_end_sub - cols) / max(0.8, 1.8 * scale_w), 0.0, 1.0).astype(np.float32)
+        sw_spike = (np.exp(-0.5 * ((cols - (active_end_sub - 3.2 * scale_w)) / max(0.8, 1.5 * scale_w)) ** 2)
+                    * float(np.clip(amp * 0.22, 0.0, 0.30))).astype(np.float32)
 
         if is_nv180_capture:
-            seam_env = (np.exp(-0.5 * (r_rel / 0.75) ** 2) * in_band).astype(np.float32)[:, None]
+            seam_env = np.exp(-0.5 * (r_rel / 0.75) ** 2).astype(np.float32)[:, None]
             sw_x_frac = 0.28 + 0.44 * (0.5 + 0.5 * float(np.sin(frame_index * 1.37 + 0.9)))
             sw_x_gate = np.clip((cols - float(W) * sw_x_frac) / max(1.0, 6.0 * scale_w), 0.0, 1.0).astype(np.float32)
-            seam_ripple = (0.08 + 0.10 * noise) * seam_env * sw_x_gate * float(np.clip(amp, 0.0, 1.2))
-            overlap_ripple = (0.016 * amp * noise * np.exp(-r_rel / max(3.0, span_rows * 0.65))[:, None]) * in_band[:, None].astype(np.float32)
+            seam_ripple = (0.08 + 0.10 * noise_sub) * seam_env * sw_x_gate * float(np.clip(amp, 0.0, 1.2))
+            overlap_ripple = (0.016 * amp * noise_sub * np.exp(-r_rel / max(3.0, span_rows * 0.65))[:, None]).astype(np.float32)
             row_dip = (1.0 - 0.06 * amp * (r_rel == 1.0).astype(np.float32))[:, None]
         else:
-            # Bipolar White/Black RF Switching Transient Impulse Packet (`切换点黑白双极性限幅尖峰簇`):
-            # At `cols ~ sw_x_row` on the switching seam lines (`r_rel ~ 0..2.2`), the rotary transformer
-            # RF phase jump drives the FM limiter into a crisp white spike dash flanked by a black unlock trough.
             w_pkt = max(5.0, (14.0 + 18.0 * float(np.clip(amp, 0.0, 1.2))) * scale_w)
             dx_sw = cols - sw_x_row
             pkt_white = np.exp(-0.5 * ((dx_sw - 0.30 * w_pkt) / max(1.0, 0.24 * w_pkt)) ** 2)
@@ -1334,63 +1275,50 @@ class TapeStage(Stage):
                 0.62 * np.exp(-0.5 * ((dx_sw + 0.14 * w_pkt) / max(0.8, 0.16 * w_pkt)) ** 2)
                 + 0.88 * np.exp(-0.5 * ((dx_sw - 0.84 * w_pkt) / max(1.0, 0.22 * w_pkt)) ** 2)
             )
-            fm_carrier_mod = 0.74 + 0.42 * np.cos(2.0 * np.pi * cols / max(1.6, 2.6 * scale_w)) + 0.34 * noise
-            seam_pkt_env = (np.exp(-0.5 * ((r_rel - 0.85) / 1.10) ** 2) * in_band).astype(np.float32)[:, None]
+            fm_carrier_mod = 0.74 + 0.42 * np.cos(2.0 * np.pi * cols / max(1.6, 2.6 * scale_w)) + 0.34 * noise_sub
+            seam_pkt_env = np.exp(-0.5 * ((r_rel - 0.85) / 1.10) ** 2).astype(np.float32)[:, None]
             bipolar_pkt = seam_pkt_env * float(np.clip(amp, 0.0, 1.2)) * (
                 0.52 * pkt_white * fm_carrier_mod - 0.34 * pkt_black
             )
-            # Fine post-switch RF envelope ripple along the switching line
-            seam_tail = (0.045 + 0.075 * noise) * seam_pkt_env * post_sw_x * float(np.clip(amp, 0.0, 1.2))
+            seam_tail = (0.045 + 0.075 * noise_sub) * seam_pkt_env * post_sw_x * float(np.clip(amp, 0.0, 1.2))
             seam_ripple = (bipolar_pkt + seam_tail).astype(np.float32)
-            overlap_ripple = (0.020 * amp * noise * np.exp(-r_rel / max(3.0, span_rows * 0.70))[:, None]) * in_band[:, None].astype(np.float32)
+            overlap_ripple = (0.020 * amp * noise_sub * np.exp(-r_rel / max(3.0, span_rows * 0.70))[:, None]).astype(np.float32)
             row_dip = (1.0 - 0.04 * amp * (r_rel == 1.0).astype(np.float32))[:, None]
 
-        hbi_floor = (0.015 + 0.010 * np.abs(noise)).astype(np.float32)
-        in_b_2d = in_band[:, None].astype(np.float32)
-        y_band_settled = np.clip(y_out * row_dip + sw_spike + seam_ripple + overlap_ripple, 0.0, 1.1) * hbi_gate + hbi_floor * (1.0 - hbi_gate)
-        y_out = y * (1.0 - in_b_2d) + y_band_settled * in_b_2d
+        hbi_floor = (0.015 + 0.010 * np.abs(noise_sub)).astype(np.float32)
+        y_band_settled = np.clip(y_sub * row_dip + sw_spike + seam_ripple + overlap_ripple, 0.0, 1.1) * hbi_gate + hbi_floor * (1.0 - hbi_gate)
 
-        # Store `hs_active_end` in plan or stage state so PlayerStage can preserve the sharp HBI blanking step
-        self._last_hs_in_band = in_band
-        self._last_hs_active_end = active_end[:, 0]
+        y_out = y.copy()
+        i_out = i.copy()
+        q_out = q.copy()
+        y_out[band_start_row:] = y_band_settled
 
-        # --- 3. 1H/2H Delay-Line Comb Chroma & Post-Switch APC Burst Phase Shift ---
-        c_keep = c_keep_1d[:, None].astype(np.float32) * hbi_gate
+        active_end_full = np.full(H, float(W), dtype=np.float32)
+        active_end_full[band_start_row:] = active_end_sub[:, 0]
+        self._last_hs_in_band = in_band_all
+        self._last_hs_active_end = active_end_full
+
+        c_keep = c_keep_1d[:, None] * hbi_gate
         if not is_nv180_capture:
-            # Post-switch 629 kHz colour-under APC burst phase step across the 1H delay-line comb:
-            # Suppresses R and B slightly relative to G (`dRGB ~ (-0.043, -0.005, -0.055)` in HK VHS commercial),
-            # imparting the characteristic olive / yellow-green APC phase-step tint to the bottom rows.
-            apc_env = (exp_pull * in_band).astype(np.float32)[:, None] * head_b_gate * hbi_gate
+            apc_env = exp_pull[:, None] * head_b_gate * hbi_gate
             phi_apc = (0.24 * amp * comb_sign)[:, None].astype(np.float32) * apc_env
             cs_a, sn_a = np.cos(phi_apc), np.sin(phi_apc)
-            i_rot = i_out * cs_a - q_out * sn_a - (0.022 * amp) * apc_env
-            q_rot = i_out * sn_a + q_out * cs_a - (0.034 * amp) * apc_env
-            i_out = i * (1.0 - in_b_2d) + (i_rot * c_keep) * in_b_2d
-            q_out = q * (1.0 - in_b_2d) + (q_rot * c_keep) * in_b_2d
+            i_rot = i_sub * cs_a - q_sub * sn_a - (0.022 * amp) * apc_env
+            q_rot = i_sub * sn_a + q_sub * cs_a - (0.034 * amp) * apc_env
+            i_out[band_start_row:] = i_rot * c_keep
+            q_out[band_start_row:] = q_rot * c_keep
         else:
-            i_out = i * (1.0 - in_b_2d) + (i_out * c_keep) * in_b_2d
-            q_out = q * (1.0 - in_b_2d) + (q_out * c_keep) * in_b_2d
+            i_out[band_start_row:] = i_sub * c_keep
+            q_out[band_start_row:] = q_sub * c_keep
 
-        # --- chroma phase step at the head switch --------------------------
-        # In SP the two heads hand the subcarrier over with phase continuity
-        # maintained, so nothing is visible.  In LP/EP the tracks are narrower and
-        # the phase relationship across the switch cannot be held, so each field
-        # boundary leaves a *phase step* -- which is what the reference "abnormal"
-        # capture shows as regular horizontal colour bands lying across every bar,
-        # with the luminance level unchanged.  Keyed to the speed so SP stays
-        # clean, and to the tracking error because a mistracked head reads the
-        # phase reference from the wrong track.
         if self.speed.ratio < 0.999:
             step_amt = (0.55 * (1.0 - self.speed.ratio)
                         * (1.0 + 1.6 * float(self.tracking_error)))
-            # a distinct step per field, alternating sign, so bands alternate hue
             sign = 1.0 if (frame_index % 2 == 0) else -1.0
-            ph = (sign * step_amt * np.pi) * in_band.astype(np.float32)
+            ph = (sign * step_amt * np.pi) * in_band_all.astype(np.float32)
             if float(self.tracking_error) > 1e-4:
-                # Field-rate horizontal chroma banding across the frame in LP/EP mistracking
-                # (11-20 rows tall, 42-60 row spacing, chroma phase & gain modulated while luma holds)
                 spacing = max(24.0, 52.0 * (H / 576.0))
-                wave = np.sin(2.0 * np.pi * (rows.astype(np.float32) / spacing + frame_index * 0.17)) ** 3
+                wave = np.sin(2.0 * np.pi * (rows_all.astype(np.float32) / spacing + frame_index * 0.17)) ** 3
                 env = np.clip(wave, 0.0, 1.0).astype(np.float32)
                 strength = (1.0 - self.speed.ratio) * float(np.clip(self.tracking_error, 0.0, 1.5))
                 ph = ph + (0.65 * strength * env * np.pi)
@@ -1401,29 +1329,24 @@ class TapeStage(Stage):
                 c, sn = np.cos(ph)[:, None], np.sin(ph)[:, None]
                 i_out, q_out = i_out * c - q_out * sn, i_out * sn + q_out * c
 
-        # --- optional mid-line jitter (ntsc-rs models this) ----------------
-        # The head switch can occur part-way along a line, displacing the tail of
-        # that line only.  Without this the band is a clean rectangle; with it the
-        # strip shows a few half-line steps, which is what the real artefact does.
         if self.hs_mid_line > 1e-4:
-            mid = in_band & (rng.random(H) < self.hs_mid_line)
+            mid = in_band_all & (rng.random(H) < self.hs_mid_line)
             for row in np.nonzero(mid)[0]:
-                cut = int(rng.integers(y.shape[1] // 4, y.shape[1] * 3 // 4))
+                cut = int(rng.integers(W // 4, W * 3 // 4))
                 amount = float(rng.uniform(-1.0, 1.0) * 18.0 * self.hs_mid_line)
                 seg = y_out[row, cut:].astype(np.float32)
                 src_idx = np.clip(np.arange(seg.size) - amount, 0, seg.size - 1)
                 y_out[row, cut:] = np.interp(src_idx, np.arange(seg.size), seg)
                 i_out[row, cut:] *= 0.4
                 q_out[row, cut:] *= 0.4
-        return y_out, i_out, q_out, w
+        return y_out, i_out, q_out, None
 
     def _apply_dropouts(self, comp: np.ndarray, frame_index: int,
                         rng: np.random.Generator) -> tuple[np.ndarray, np.ndarray]:
         plan = self.plan
         H, W = comp.shape
-        empty = np.zeros(comp.shape, dtype=np.float32)
         if not plan.dropouts:
-            return comp, empty
+            return comp, None
         total: np.ndarray | None = None
         for ev in plan.dropouts[self._drop_cursor:]:
             if ev.start_frame > frame_index:
@@ -1450,7 +1373,7 @@ class TapeStage(Stage):
                 total = np.zeros((H, W), dtype=np.float32)
             np.maximum(total[r0:r1, c0:c1], patch, out=total[r0:r1, c0:c1])
         if total is None or not np.any(total > 0.0):
-            return comp, empty
+            return comp, None
 
         # Physical FM Limiter Unlock Spike + 1H Delay-Line Dropout Compensator (DOC)
         # On a VCR like the Panasonic NV-J27, when the RF envelope drops below the FM limiter
@@ -1478,38 +1401,65 @@ class TapeStage(Stage):
 
     def _apply_creases(self, comp: np.ndarray, frame_index: int,
                        precomputed_mask: np.ndarray | None = None
-                       ) -> tuple[np.ndarray, np.ndarray]:
+                       ) -> tuple[np.ndarray, np.ndarray | tuple | None]:
         plan = self.plan
         if not plan.creases:
-            return comp, np.zeros(comp.shape, dtype=np.float32)
+            return comp, None
+        H, W = comp.shape
         if precomputed_mask is not None:
-            total = precomputed_mask
+            if isinstance(precomputed_mask, list):
+                band_list = precomputed_mask
+            else:
+                return comp, None
         else:
-            H, W = comp.shape
-            rows = np.arange(H, dtype=np.float32)[:, None]
             cols = np.arange(W, dtype=np.float32)[None, :] / max(1.0, W)
-            total = None
+            raw_intervals = []
             for cr in plan.creases:
                 t = frame_index / max(1e-6, cr.period_frames) + cr.phase
-                pos = (0.5 + 0.5 * np.sin(t * 2.0 * np.pi)) * (H + 2 * cr.width) \
-                    - cr.width + cr.offset
+                pos = (0.5 + 0.5 * np.sin(t * 2.0 * np.pi)) * (H + 2 * cr.width) - cr.width + cr.offset
                 slope_w = float(np.tan(cr.angle)) * W
                 c_min = min(pos, pos + slope_w) - cr.width
                 c_max = max(pos, pos + slope_w) + cr.width
                 if c_max < 0.0 or c_min >= H:
                     continue
-                centre = pos + slope_w * cols
-                d = np.abs(rows - centre)
-                band = np.clip(1.0 - d / max(1.0, cr.width), 0.0, 1.0) ** 1.6
-                if total is None:
-                    total = (band * cr.depth).astype(np.float32)
+                r0 = max(0, int(np.floor(c_min)))
+                r1 = min(H, int(np.ceil(c_max)) + 1)
+                if r1 <= r0:
+                    continue
+                raw_intervals.append((r0, r1, pos, slope_w, float(cr.width), float(cr.depth)))
+            if not raw_intervals:
+                return comp, None
+            raw_intervals.sort(key=lambda x: x[0])
+            merged = []
+            for item in raw_intervals:
+                r0, r1 = item[0], item[1]
+                if merged and r0 <= merged[-1][1] + 12:
+                    merged[-1][1] = max(merged[-1][1], r1)
+                    merged[-1][2].append(item)
                 else:
-                    np.maximum(total, (band * cr.depth).astype(np.float32), out=total)
-        if total is None or not np.any(total > 0.0):
-            return comp, (total if total is not None else np.zeros(comp.shape, dtype=np.float32))
-        soft = lowpass(comp, 1.6)
-        comp = comp * (1.0 - 0.55 * total) + soft * (0.55 * total)
-        return comp, total
+                    merged.append([r0, r1, [item]])
+            band_list = []
+            for mr0, mr1, items in merged:
+                sub_mask = np.zeros((mr1 - mr0, W), dtype=np.float32)
+                for (r0, r1, pos, slope_w, cr_w, cr_d) in items:
+                    rows_sub = np.arange(r0, r1, dtype=np.float32)[:, None]
+                    centre = pos + slope_w * cols
+                    d = np.abs(rows_sub - centre)
+                    x = np.clip(np.float32(1.0) - d * np.float32(1.0 / max(1.0, cr_w)), 0.0, 1.0)
+                    band = x * (np.float32(0.065) + x * (np.float32(1.215) - np.float32(0.280) * x)) * np.float32(cr_d)
+                    dest = sub_mask[r0 - mr0 : r1 - mr0]
+                    np.maximum(dest, band, out=dest)
+                band_list.append((mr0, mr1, sub_mask))
+            precomputed_mask = band_list
+
+        out = comp.copy()
+        for (mr0, mr1, sub_mask) in band_list:
+            pad_r0 = max(0, mr0 - 6)
+            pad_r1 = min(H, mr1 + 6)
+            soft_sub = lowpass(comp[pad_r0:pad_r1], 1.6)[mr0 - pad_r0 : mr1 - pad_r0]
+            w_sub = np.float32(0.55) * sub_mask
+            out[mr0:mr1] = comp[mr0:mr1] * (np.float32(1.0) - w_sub) + soft_sub * w_sub
+        return out, precomputed_mask
 
     def _apply_edit_glitch(self, y: np.ndarray, i: np.ndarray, q: np.ndarray,
                            frame_index: int, rng: np.random.Generator
@@ -1676,17 +1626,39 @@ class TapeStage(Stage):
         assert self._grain is not None and self._static_grain is not None
         self._fields_for(comp.shape)
         dyn = self._grain.sample(frame_index)
-        # fixed particle texture + slowly drifting component
-        mixed = 0.45 * self._static_grain + 0.55 * dyn.astype(np.float32)
-        # reproduced-output loss at lower tape speeds shows up here
         snr = 10.0 ** (self.speed.snr_loss_db / 20.0)
-        amt = 0.055 * self.noise_floor * snr
+        amt = float(0.055 * self.noise_floor * snr)
+        from ..core.signal import get_native_lib
+        lib = get_native_lib()
+        if lib is not None and comp.ndim == 2 and comp.dtype == np.float32:
+            cc = np.ascontiguousarray(comp, dtype=np.float32)
+            sg = np.ascontiguousarray(self._static_grain, dtype=np.float32)
+            dg = np.ascontiguousarray(dyn, dtype=np.float32)
+            out = np.empty_like(cc)
+            if self._drift is not None and self.do_color > 1e-4:
+                tilt = np.ascontiguousarray(self._drift.sample(frame_index), dtype=np.float32)
+                striping_1d = np.ascontiguousarray(
+                    np.cos(2.0 * np.pi * np.arange(cc.shape[1], dtype=np.float32) / 48.0),
+                    dtype=np.float32,
+                )
+                lib.vml_tape_noise_floor_f32(
+                    cc.ctypes.data, sg.ctypes.data, dg.ctypes.data,
+                    tilt.ctypes.data, striping_1d.ctypes.data,
+                    amt, float(amt * 0.5 * self.do_color),
+                    out.ctypes.data, cc.shape[0], cc.shape[1],
+                )
+            else:
+                lib.vml_tape_noise_floor_f32(
+                    cc.ctypes.data, sg.ctypes.data, dg.ctypes.data,
+                    None, None, amt, 0.0,
+                    out.ctypes.data, cc.shape[0], cc.shape[1],
+                )
+            return out
+
+        mixed = 0.45 * self._static_grain + 0.55 * dyn.astype(np.float32)
         out = comp + amt * mixed
         if self._drift is not None and self.do_color > 1e-4:
             tilt = self._drift.sample(frame_index).astype(np.float32)
-            # the recorded subcarrier sits at a fixed frequency, so residual
-            # chroma in the RF domain shows as a fine stripe along the scan
-            # direction rather than as isotropic grain
             striping = np.cos(
                 2.0 * np.pi * np.arange(comp.shape[1], dtype=np.float32) / 48.0
             ).astype(np.float32)[None, :]
@@ -2688,8 +2660,10 @@ class TapeStage(Stage):
 
         # 3. lost signal patches: the carrier is gone, so chroma goes with it
         y, dropout_mask = self._apply_dropouts(y, frame_index, rng)
-        i = i * (1.0 - np.clip(dropout_mask, 0.0, 1.0))
-        q = q * (1.0 - np.clip(dropout_mask, 0.0, 1.0))
+        if dropout_mask is not None:
+            keep_do = np.float32(1.0) - np.clip(dropout_mask, 0.0, 1.0)
+            i = i * keep_do
+            q = q * keep_do
 
         # 4. head-switching tear at the end of each field
         y, i, q, hs_mask = self._head_switch(y, i, q, frame_index, rng)
@@ -2744,7 +2718,7 @@ class TapeStage(Stage):
             pstate = evaluate_power_bus(
                 self.ctx.params, frame_index, self.ctx.fps,
                 y.shape[0], y.shape[1], self.ctx.seed,
-                row_luma=np.clip(y, 0.0, 1.0).mean(axis=1),
+                row_luma=np.clip(y[:, ::4].mean(axis=1), 0.0, 1.0),
             )
         if pstate is not None and pstate.active:
             if len(pstate.servo_line_shift) == y.shape[0] and np.any(np.abs(pstate.servo_line_shift) > 1e-4):
@@ -2793,7 +2767,7 @@ class TapeStage(Stage):
             _s_out = SignalFrame(y.astype(np.float32), i.astype(np.float32), q.astype(np.float32))
             _s_out._rf_direct = _rf_dir
             out.meta["signal"] = _s_out
-        out.meta["tap_tape_rgb"] = SignalFrame(y.astype(np.float32), i.astype(np.float32), q.astype(np.float32)).to_rgb()
+        out.meta["tap_tape_signal"] = SignalFrame(y.astype(np.float32, copy=False), i.astype(np.float32, copy=False), q.astype(np.float32, copy=False))
         out.meta["dropout_mask"] = dropout_mask
         if ts_diag is not None:
             out.meta["transport_servo"] = ts_diag

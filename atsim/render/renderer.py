@@ -415,14 +415,17 @@ class Renderer:
                 src_frame = self.source.frame(index)
             src_frame = self._fit_source(src_frame)
             cam: CameraStage = self.stage["camera"]  # type: ignore[assignment]
-            if self._prev_src is None and index > 0:
-                try:
-                    self._prev_src = self.source.frame(index - 1)
-                except Exception:
-                    self._prev_src = None
-            if self._prev_src is not None:
-                self._prev_src = self._fit_source(self._prev_src)
-            cam.set_previous(self._prev_src)
+            if getattr(cam, "motion_blur", 0.0) > 1e-4:
+                if self._prev_src is None and index > 0:
+                    try:
+                        self._prev_src = self.source.frame(index - 1)
+                    except Exception:
+                        self._prev_src = None
+                if self._prev_src is not None:
+                    self._prev_src = self._fit_source(self._prev_src)
+                cam.set_previous(self._prev_src)
+            else:
+                cam.set_previous(None)
             buf = FrameBuffer(np.asarray(src_frame, dtype=np.float32), None, index,
                               index / max(1e-6, self.fps), self.std,
                               {"field": index % 2})
@@ -461,12 +464,45 @@ class Renderer:
             self._prev_src = np.asarray(src_frame, dtype=np.float32)
         return buf.rgb  # type: ignore[union-attr]
 
+    def needs_sequential_state(self) -> bool:
+        cam_p = self.params.get("camera") or {}
+        fmt_p = self.params.get("format") or {}
+        tpe_p = self.params.get("tape") or {}
+        return bool(
+            float(cam_p.get("ae_enabled", 0.0)) > 0.5
+            or float(cam_p.get("awb_enabled", 0.0)) > 0.5
+            or float(cam_p.get("af_enabled", 0.0)) > 0.5
+            or float(cam_p.get("nv_mode", 0.0)) > 0.5
+            or float(fmt_p.get("chroma_lag", 0.0)) > 1e-4
+            or float(tpe_p.get("shuttle_speed", 0.0)) > 1e-4
+            or int(round(float(tpe_p.get("transport_state", 0.0)))) != 0
+        )
+
+    def render_frame_u8_with_src(self, index: int, src_u8: np.ndarray,
+                                 prev_src_u8: np.ndarray | None = None) -> np.ndarray:
+        """Fast worker entry point: takes uint8 source frame(s) and returns uint8 rendered RGB."""
+        scale_f = np.float32(1.0 / 255.0)
+        try:
+            import cv2 as _cv2
+            lut = getattr(Renderer, "_U8_LUT", None)
+            if lut is None:
+                lut = (np.arange(256, dtype=np.float32) * scale_f).reshape(256, 1)
+                Renderer._U8_LUT = lut
+            src_f32 = _cv2.LUT(src_u8, lut)
+            self._prev_src = _cv2.LUT(prev_src_u8, lut) if prev_src_u8 is not None else None
+        except Exception:
+            src_f32 = src_u8.astype(np.float32) * scale_f
+            self._prev_src = (prev_src_u8.astype(np.float32) * scale_f) if prev_src_u8 is not None else None
+        rgb = self._render_index(int(index), src_f32)
+        return (np.clip(rgb, 0.0, 1.0) * np.float32(255.0) + np.float32(0.5)).astype(np.uint8)
+
     def render_frames(self, indices: list[int], limit: int | None = None,
                       should_stop: Callable[[], bool] | None = None
                       ) -> Iterator[tuple[int, np.ndarray]]:
         wanted = sorted({int(i) for i in indices})
         if not wanted:
             return
+        wanted_set = set(wanted)
         if self.chain is None:
             self._build_chain()
 
@@ -476,30 +512,20 @@ class Renderer:
             return
 
         top = max(wanted)
+        first_w = min(wanted)
         start_idx = 0
-        if self.preview and len(wanted) == 1 and not self.streaming:
-            cam_p = self.params.get("camera") or {}
-            fmt_p = self.params.get("format") or {}
-            tpe_p = self.params.get("tape") or {}
-            dsp_p = self.params.get("display") or {}
-            needs_multi = (
-                float(cam_p.get("ae_enabled", 0.0)) > 0.5
-                or float(cam_p.get("awb_enabled", 0.0)) > 0.5
-                or float(cam_p.get("af_enabled", 0.0)) > 0.5
-                or float(cam_p.get("nv_mode", 0.0)) > 0.5
-                or float(fmt_p.get("chroma_lag", 0.0)) > 1e-4
-                or float(tpe_p.get("shuttle_speed", 0.0)) > 1e-4
-            )
+        needs_multi = self.needs_sequential_state()
+        if (self.preview and len(wanted) == 1) or self.streaming:
             if not needs_multi:
-                start_idx = top
+                start_idx = first_w
             else:
-                start_idx = max(0, top - 6)
+                start_idx = max(0, first_w - 6)
         pumped = 0
         for index in range(start_idx, top + 1):
             if should_stop is not None and should_stop():
                 return
             if index in self._cache["display"]:
-                if index in wanted:
+                if index in wanted_set:
                     yield index, self._cache["display"][index]
                 continue
             if limit is not None and pumped >= limit:
@@ -516,7 +542,7 @@ class Renderer:
                 raise
             pumped += 1
             self._pumps += 1
-            if index in wanted:
+            if index in wanted_set:
                 yield index, rgb
 
     def render_frame(self, index: int) -> np.ndarray:

@@ -397,7 +397,7 @@ class DisplayStage(Stage):
             meta_sub["signal"] = SignalFrame.from_rgb(rgb_in, buf.std)
             return FrameBuffer(rgb_in, buf.composite, buf.index, buf.time, buf.std, meta_sub)
 
-        rgb = buf.rgb if sig is None else sig.to_rgb()
+        rgb = buf.rgb if sig is None else (getattr(sig, "_cached_rgb", None).copy() if getattr(sig, "_cached_rgb", None) is not None else sig.to_rgb())
 
         # 1. Deflection yoke geometry warp, keystone, curvature, breathing & misconvergence
         _geom_on = (self.geometry > 1e-3 or abs(self.curvature) > 1e-6
@@ -532,8 +532,8 @@ class DisplayStage(Stage):
             meta_out["crt_magnet_env"] = mag_info
         if self.mv_spec.is_active():
             cam_tap = meta_out["tap_camera_rgb"] if "tap_camera_rgb" in meta_out else rgb
-            fmt_tap = meta_out["tap_format_rgb"] if "tap_format_rgb" in meta_out else cam_tap
-            vtr_tap = meta_out["tap_tape_rgb"] if "tap_tape_rgb" in meta_out else fmt_tap
+            fmt_tap = meta_out["tap_format_rgb"] if "tap_format_rgb" in meta_out else (meta_out["tap_format_signal"].to_rgb() if "tap_format_signal" in meta_out else cam_tap)
+            vtr_tap = meta_out["tap_tape_rgb"] if "tap_tape_rgb" in meta_out else (meta_out["tap_tape_signal"].to_rgb() if "tap_tape_signal" in meta_out else fmt_tap)
             tbc_tap = meta_out["tap_player_rgb"] if "tap_player_rgb" in meta_out else vtr_tap
             no_sig = (meta_out["format"] == "no_signal") if "format" in meta_out else False
             if int(self.mv_spec.layout_mode) == 1:

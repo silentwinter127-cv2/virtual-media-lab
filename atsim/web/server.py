@@ -1601,6 +1601,71 @@ class App:
                                 mode=mode, sample_rate=sample_rate)
         return wav_encode(run.pcm, sample_rate=run.sample_rate)
 
+    def export_audio_wav_file(self, out_path: str | Path, start_s: float = 0.0,
+                              duration_s: float = 4.0, mode: str = "sim",
+                              sample_rate: int = 44100, clean: bool = False) -> Path:
+        """
+        Stream full-length audio (including 20+ minute / 36,000+ frame films) in 30-second
+        bounded-memory windows directly to a standard 16-bit stereo RIFF WAV file on disk.
+        """
+        import struct
+        out_p = Path(out_path)
+        if clean or mode in ("source", "original", "clean"):
+            mode = "source"
+        sr = int(sample_rate)
+        total_dur = max(0.2, float(duration_s))
+        chunk_s = 30.0
+        n_ch = 2
+        byte_rate = sr * n_ch * 2
+        block_align = n_ch * 2
+
+        with open(out_p, "wb") as fh:
+            # Write placeholder 44-byte RIFF header, then seek back and patch data_size at end
+            fh.write(b"\x00" * 44)
+            data_bytes = 0
+            cur_s = max(0.0, float(start_s))
+            end_s = cur_s + total_dur
+            while cur_s < end_s - 1e-3:
+                win_s = min(chunk_s, end_s - cur_s)
+                if win_s < 0.05:
+                    break
+                run = self.audio_window(start_s=cur_s, duration_s=win_s,
+                                        mode=mode, sample_rate=sr)
+                arr = np.asarray(run.pcm, dtype=np.float32)
+                if arr.ndim == 1:
+                    arr = np.stack([arr, arr], axis=-1)
+                elif arr.shape[1] == 1:
+                    arr = np.repeat(arr, 2, axis=1)
+                else:
+                    arr = arr[:, :2]
+                target_samples = int(round(win_s * sr))
+                if len(arr) > target_samples > 0:
+                    arr = arr[:target_samples]
+                pcm16 = np.clip(np.round(arr * 32767.0), -32768, 32767).astype("<i2")
+                raw = pcm16.tobytes()
+                fh.write(raw)
+                data_bytes += len(raw)
+                cur_s += win_s
+            header = struct.pack(
+                "<4sI4s4sIHHIIHH4sI",
+                b"RIFF",
+                36 + data_bytes,
+                b"WAVE",
+                b"fmt ",
+                16,
+                1,
+                n_ch,
+                sr,
+                byte_rate,
+                block_align,
+                16,
+                b"data",
+                data_bytes,
+            )
+            fh.seek(0)
+            fh.write(header)
+        return out_p
+
     def audio_timeline(self, start_s: float = 0.0, duration_s: float = 4.0) -> dict:
         """
         Return the synchronized audio waveform envelope and per-frame A/V fault telemetry
@@ -1660,6 +1725,8 @@ class App:
     def _run_render(self, job_id: str, scale: float, crf: int, keep_audio: bool,
                     preset: str = "medium") -> None:
         import gc
+        import os
+        from concurrent.futures import ThreadPoolExecutor
         job = self.jobs[job_id]
         sim_wav_path = None
         r = None
@@ -1668,21 +1735,17 @@ class App:
             project = Project.from_dict(self.current.to_dict())
             store = SessionStore(self.store.data_dir)
             store.projects[project.id] = project
-            # The source already delivers frames at the requested scale, so the
-            # renderer must be sized to *its* dimensions.  Scaling the source's
-            # nominal size again leaves the stage buffers at a different shape
-            # than the frames flowing through them.
             src = store.source_for((project.id, scale), project)
             width = int(getattr(src, "width", 720))
             height = int(getattr(src, "height", 480))
             resolved_p = project.resolved_params()
-            # Enable streaming=True for batch export so intermediate stages do not
-            # accumulate unbounded float32 frame caches in RAM/pagefile ([WinError 1455]).
             r = Renderer(src, width, height, project.fps, resolved_p,
                          seed=project.seed, std_key=project.standard,
                          preview=(scale < 1.0), scale=1.0,
                          streaming=True, max_cache_frames=2)
-            r.set_time_varying(project.keyframe_tracks(), project.environment_state())
+            kf_tracks = project.keyframe_tracks()
+            env_state = project.environment_state()
+            r.set_time_varying(kf_tracks, env_state)
             total = max(1, int(getattr(src, "frame_count", 1)))
             out_path = self.store.renders / f"{job_id}.mp4"
             audio_src = None
@@ -1691,12 +1754,12 @@ class App:
                 aud_enabled = float(aud_cfg.get("enabled", 1.0)) > 0.5
                 if aud_enabled:
                     try:
+                        job.update(state="running", message="正在分段合成全片音轨…", total=total)
                         dur_s = float(total) / max(1.0, float(project.fps))
-                        wav_bytes = self.audio_wav(start_s=0.0, duration_s=dur_s, mode="sim", sample_rate=44100)
                         sim_wav_path = self.store.renders / f"{job_id}_audio.wav"
-                        sim_wav_path.write_bytes(wav_bytes)
+                        self.export_audio_wav_file(sim_wav_path, start_s=0.0, duration_s=dur_s,
+                                                   mode="sim", sample_rate=44100)
                         audio_src = str(sim_wav_path)
-                        del wav_bytes
                         gc.collect()
                     except Exception:
                         if project.source:
@@ -1708,19 +1771,120 @@ class App:
                     if clip.exists():
                         audio_src = str(clip)
 
+            cpu_n = max(1, int(os.cpu_count() or 2))
+            # Reserve 1 core for FFmpeg decode/encode pipes; on >=4-core CPUs use multi-worker pool
+            num_workers = min(max(1, cpu_n - 1), 8) if cpu_n >= 4 else 1
+            needs_seq = r.needs_sequential_state()
+            need_prev = float((resolved_p.get("camera") or {}).get("motion_blur", 0.0)) > 1e-4
+            t_render_start = time.perf_counter()
             job.update(state="running", message="渲染中", total=total)
+
             with VideoWriter(out_path, width, height, project.fps, crf=crf,
                              preset=preset) as vw:
                 vw.open(audio_from=audio_src if audio_src else None)
-                for i, rgb in r.render_frames(list(range(total))):
-                    vw.write(rgb)
-                    if i % 5 == 0 or i == total - 1:
-                        job["progress"] = (i + 1) / total
-                        job["message"] = f"渲染中 {i + 1}/{total}"
-                        if job.get("cancel"):
-                            break
-                    if i % 25 == 24:
-                        gc.collect()
+                used_parallel = False
+                if not needs_seq and total >= 8 and num_workers >= 2:
+                    try:
+                        from ..io.source import SyntheticSource
+                        # Warm up frame 0 on `r` and pre-build the full TapePlan once so all worker threads share it read-only
+                        f0_src = src.frame(0)
+                        f0_rgb = r._render_index(0, f0_src)
+                        if "tape" in r.stage and hasattr(r.stage["tape"], "_ensure"):
+                            r.stage["tape"]._ensure(total)
+                        vw.write(f0_rgb)
+                        written = 1
+
+                        tls = threading.local()
+                        kf_raw = list(project.keyframes or [])
+                        env_raw = dict(project.environment or {})
+                        shared_tape_plan = getattr(r.stage.get("tape"), "plan", None)
+                        shared_tape = r.stage.get("tape")
+
+                        def _thread_render_one(idx: int, cur_f32: np.ndarray, prev_f32: np.ndarray | None) -> np.ndarray:
+                            w_ren = getattr(tls, "renderer", None)
+                            if w_ren is None:
+                                dummy = SyntheticSource(width=width, height=height, frames=max(1, total), fps=project.fps)
+                                w_ren = Renderer(
+                                    dummy, width, height, project.fps, resolved_p,
+                                    seed=project.seed, std_key=project.standard,
+                                    preview=(scale < 1.0), scale=1.0,
+                                    total_frames=total, streaming=True, max_cache_frames=1,
+                                )
+                                w_ren.set_time_varying(kf_raw, env_raw)
+                                w_ren._build_chain()
+                                if shared_tape_plan is not None and "tape" in w_ren.stage:
+                                    wt = w_ren.stage["tape"]
+                                    wt.plan = shared_tape_plan
+                                    if shared_tape is not None:
+                                        wt._grain = getattr(shared_tape, "_grain", None)
+                                        wt._static_grain = getattr(shared_tape, "_static_grain", None)
+                                        wt._drift = getattr(shared_tape, "_drift", None)
+                                        wt._binder = getattr(shared_tape, "_binder", None)
+                                        wt._walk_offset = getattr(shared_tape, "_walk_offset", None)
+                                        wt._fields_shape = getattr(shared_tape, "_fields_shape", None)
+                                tls.renderer = w_ren
+                            w_ren._prev_src = prev_f32
+                            rgb_out = w_ren._render_index(idx, cur_f32)
+                            return (np.clip(rgb_out, 0.0, 1.0) * np.float32(255.0) + np.float32(0.5)).astype(np.uint8)
+
+                        with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                            used_parallel = True
+                            max_inflight = num_workers * 2
+                            pending_futures = []
+                            prev_f32: np.ndarray | None = f0_src if need_prev else None
+
+                            for idx in range(1, total):
+                                if job.get("cancel"):
+                                    break
+                                cur_f32 = src.frame(idx)
+                                p_arg = prev_f32 if need_prev else None
+                                fut = pool.submit(_thread_render_one, int(idx), cur_f32, p_arg)
+                                pending_futures.append((int(idx), fut))
+                                if need_prev:
+                                    prev_f32 = cur_f32
+
+                                while len(pending_futures) >= max_inflight:
+                                    _fi, done_fut = pending_futures.pop(0)
+                                    out_u8 = done_fut.result()
+                                    vw.write_u8(out_u8)
+                                    written += 1
+                                    if written % 5 == 0 or written == total:
+                                        el = max(1e-3, time.perf_counter() - t_render_start)
+                                        fps_now = written / el
+                                        eta_s = int(max(0.0, (total - written) / max(1e-3, fps_now)))
+                                        job["progress"] = written / total
+                                        job["message"] = f"并行渲染中 ({num_workers}线程) {written}/{total} · {fps_now:.1f} fps · 剩余 {eta_s // 60}m{eta_s % 60:02d}s"
+
+                            for _fi, done_fut in pending_futures:
+                                if job.get("cancel"):
+                                    break
+                                out_u8 = done_fut.result()
+                                vw.write_u8(out_u8)
+                                written += 1
+                                if written % 5 == 0 or written == total:
+                                    el = max(1e-3, time.perf_counter() - t_render_start)
+                                    fps_now = written / el
+                                    eta_s = int(max(0.0, (total - written) / max(1e-3, fps_now)))
+                                    job["progress"] = written / total
+                                    job["message"] = f"并行渲染中 ({num_workers}线程) {written}/{total} · {fps_now:.1f} fps · 剩余 {eta_s // 60}m{eta_s % 60:02d}s"
+                    except Exception:
+                        if vw.frames_written > 0:
+                            raise
+                        used_parallel = False
+
+                if not used_parallel:
+                    for i, rgb in r.render_frames(list(range(total))):
+                        vw.write(rgb)
+                        if i % 5 == 0 or i == total - 1:
+                            el = max(1e-3, time.perf_counter() - t_render_start)
+                            fps_now = (i + 1) / el
+                            eta_s = int(max(0.0, (total - (i + 1)) / max(1e-3, fps_now)))
+                            job["progress"] = (i + 1) / total
+                            job["message"] = f"渲染中 {i + 1}/{total} · {fps_now:.1f} fps · 剩余 {eta_s // 60}m{eta_s % 60:02d}s"
+                            if job.get("cancel"):
+                                break
+                        if i % 25 == 24:
+                            gc.collect()
             job.update(state="done", progress=1.0, message="完成", path=str(out_path))
         except Exception as exc:
             job.update(state="error", message=f"{type(exc).__name__}: {exc}",
@@ -1740,6 +1904,51 @@ class App:
                 except Exception:
                     pass
             gc.collect()
+# ---------------------------------------------------------------------------
+_EXPORT_WORKER_RENDERER: Renderer | None = None
+
+
+def _export_worker_init(
+    width: int,
+    height: int,
+    fps: float,
+    resolved_params: dict,
+    seed: int,
+    std_key: str,
+    preview: bool,
+    total_frames: int,
+    keyframes: list,
+    environment: dict,
+) -> None:
+    """Initialize a persistent per-process Renderer for multi-core batch video export."""
+    global _EXPORT_WORKER_RENDERER
+    try:
+        import cv2 as _cv2
+        _cv2.setNumThreads(1)
+    except Exception:
+        pass
+    from ..io.source import SyntheticSource
+    dummy_src = SyntheticSource(width=width, height=height, frames=max(1, total_frames), fps=fps)
+    r = Renderer(
+        dummy_src, width, height, fps, resolved_params,
+        seed=seed, std_key=std_key, preview=preview, scale=1.0,
+        total_frames=total_frames, streaming=True, max_cache_frames=1,
+    )
+    r.set_time_varying(keyframes, environment)
+    r._build_chain()
+    _EXPORT_WORKER_RENDERER = r
+
+
+def _export_worker_frame(
+    index: int,
+    src_u8: np.ndarray,
+    prev_src_u8: np.ndarray | None = None,
+) -> np.ndarray:
+    """Render a single frame in a worker process and return uint8 (H, W, 3) RGB."""
+    assert _EXPORT_WORKER_RENDERER is not None
+    return _EXPORT_WORKER_RENDERER.render_frame_u8_with_src(index, src_u8, prev_src_u8)
+
+
 # ---------------------------------------------------------------------------
 def make_handler(app: App):
     class Handler(BaseHTTPRequestHandler):

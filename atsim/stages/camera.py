@@ -346,12 +346,22 @@ class CameraStage(Stage):
     def _fixed_pattern(self, shape: tuple[int, int]) -> np.ndarray:
         h, w = int(shape[0]), int(shape[1])
         if self._fpn is None or self._fpn.shape[:2] != (h, w):
-            rng = rng_for(self.ctx.seed, "camera", "fpn")
-            # column-oriented pattern (CCD column amplifiers) plus a little grain
-            col = rng.standard_normal((1, w, 3)).astype(np.float32)
-            col = lowpass(col, 1.2, axis=1)
-            grain = bandlimited_noise(rng, (h, w, 3), 1.6, 1.6)
-            self._fpn = (0.65 * col + 0.35 * grain).astype(np.float32)
+            cache = getattr(CameraStage, "_FPN_GLOBAL_CACHE", None)
+            if cache is None:
+                cache = {}
+                CameraStage._FPN_GLOBAL_CACHE = cache
+            key = (int(self.ctx.seed), h, w)
+            hit = cache.get(key)
+            if hit is None:
+                rng = rng_for(self.ctx.seed, "camera", "fpn")
+                col = rng.standard_normal((1, w, 3)).astype(np.float32)
+                col = lowpass(col, 1.2, axis=1)
+                grain = bandlimited_noise(rng, (h, w, 3), 1.6, 1.6)
+                hit = (np.float32(0.65) * col + np.float32(0.35) * grain).astype(np.float32, copy=False)
+                if len(cache) > 16:
+                    cache.pop(next(iter(cache)), None)
+                cache[key] = hit
+            self._fpn = hit
         return self._fpn
 
     def _white_balance(self, rgb: np.ndarray) -> np.ndarray:
@@ -377,7 +387,7 @@ class CameraStage(Stage):
     def _expose(self, rgb: np.ndarray) -> np.ndarray:
         if abs(self.exposure) < 1e-4:
             return rgb
-        return rgb * float(2.0 ** self.exposure)
+        return rgb * np.float32(2.0 ** self.exposure)
 
     def _nv_source_frames(self, n: int, index: int | None) -> list:
         """
@@ -726,13 +736,23 @@ class CameraStage(Stage):
         sat_stops = float(np.clip(getattr(self, "saturation_stops", 0.0), 0.0, 3.0))
         if sat_stops > 1e-4:
             white = white * float(2.0 ** (-sat_stops))
-        lin = np.clip(rgb, 0.0, None)
         span = max(1e-4, white - knee)
-        t = np.clip((lin - knee) / span, 0.0, 1.0)
-        rise = (2.0 * t) / (1.0 + t)
-        comp = np.where(lin <= knee, lin, knee + (1.0 - knee) * rise)
-        comp = np.where(lin >= white, 1.0, comp)
-        return comp.astype(np.float32)
+        from ..core.signal import get_native_lib
+        lib = get_native_lib()
+        if lib is not None and rgb.dtype == np.float32:
+            src_c = np.ascontiguousarray(rgb, dtype=np.float32)
+            dst_c = np.empty_like(src_c)
+            lib.vml_roll_off_f32(
+                src_c.ctypes.data, dst_c.ctypes.data, src_c.size,
+                float(knee), float(white), float(1.0 / span), float(2.0 * (1.0 - knee)),
+            )
+            return dst_c
+        lin = np.clip(rgb, 0.0, white).astype(np.float32, copy=False)
+        t = np.maximum(lin - np.float32(knee), np.float32(0.0)) * np.float32(1.0 / span)
+        t /= (np.float32(1.0) + t)
+        t *= np.float32(2.0 * (1.0 - knee))
+        t += np.minimum(lin, np.float32(knee))
+        return t
 
     def _overflow_drain(self, rgb: np.ndarray) -> np.ndarray:
         """
@@ -936,45 +956,68 @@ class CameraStage(Stage):
     def _halation(self, rgb: np.ndarray) -> np.ndarray:
         """
         Non-Uniform Highlight Overflow & Scalloped Multi-Petal Starburst Halo at the Sensor/Optics.
-
-        Calibrated against SONY DCR-TRV310E night captures (`328073600181017743.jpeg`,
-        `4081604481662954477.jpeg`, `862831116-1416402190.jpeg`):
-          1. **Vertical Diamond Droplet & Asymmetric Comatic Inner Core**:
-             Small and medium point emitters (such as building corridor lamps) bloom into vertically
-             elongated diamond droplets with a slight lower-right comatic bulge and downward cyan tip.
-          2. **Scalloped 6-Petal Asymmetric Iris & On-Chip Microlens Starburst Skirt**:
-             Strong street lamps and headlights cast a polygonal/scalloped multi-petal halo skirt
-             (`peak/median >= 1.46x` angular modulation around the ring) with prominent lobes at
-             `~36, 108, 180, 216, 272, 0 deg` and deep diffraction notches at `~245 deg` and `~320 deg`.
         """
         if self.halation < 1e-4 or (getattr(self.nv, "_emit", None) is not None and self.halation <= 0.50):
             return rgb
         a = float(self.halation)
         h, w = rgb.shape[:2]
         sc = min(h, w) / 540.0
-        lum = rgb @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-        hot = np.clip((lum - 0.70) / 0.28, 0.0, None)
-        if not np.any(hot > 0.0):
-            return rgb
+        try:
+            import cv2 as _cv2
+            _have_cv = True
+        except Exception:
+            _cv2 = None
+            _have_cv = False
 
         # 1. Anisotropic Vertical-Diamond Core + Lower-Right Comatic Bulge
-        sig_c = (2.2 + 3.2 * a) * max(0.65, sc)
-        core_v = lowpass(lowpass(hot, max(0.6, 0.72 * sig_c), axis=1), max(0.8, 1.38 * sig_c), axis=0)
-        core_h = lowpass(lowpass(hot, max(0.8, 1.25 * sig_c), axis=1), max(0.5, 0.68 * sig_c), axis=0)
-        core = 0.62 * core_v + 0.38 * core_h
-        # Slight downward-right comatic asymmetry on the core droplet
-        sh_y = max(1, int(round(1.4 * sc)))
-        sh_x = max(1, int(round(1.2 * sc)))
-        core_coma = np.roll(np.roll(core_v, sh_y, axis=0), sh_x, axis=1)
-        core = 0.76 * core + 0.24 * core_coma
+        ds_c = 2 if (_have_cv and min(h, w) >= 720) else 1
+        if ds_c > 1:
+            hc, wc = max(4, h // ds_c), max(4, w // ds_c)
+            rgb_c = _cv2.resize(rgb, (wc, hc), interpolation=_cv2.INTER_AREA)
+            lum_c = rgb_c @ LUMA
+            hot_c = np.clip((lum_c - np.float32(0.70)) * np.float32(1.0 / 0.28), 0.0, None)
+            if float(hot_c.max()) <= 0.0:
+                return rgb
+            hot = hot_c
+            rgb_for_tint = rgb_c
+            sig_c = (2.2 + 3.2 * a) * max(0.65, sc) / ds_c
+            core_v = lowpass(lowpass(hot_c, max(0.4, 0.72 * sig_c), axis=1), max(0.4, 1.38 * sig_c), axis=0)
+            core_h = lowpass(lowpass(hot_c, max(0.4, 1.25 * sig_c), axis=1), max(0.4, 0.68 * sig_c), axis=0)
+            core_s = np.float32(0.62) * core_v + np.float32(0.38) * core_h
+            sh_y = max(1, int(round(1.4 * sc / ds_c)))
+            sh_x = max(1, int(round(1.2 * sc / ds_c)))
+            core_coma = np.roll(np.roll(core_v, sh_y, axis=0), sh_x, axis=1)
+            core_s = np.float32(0.76) * core_s + np.float32(0.24) * core_coma
+            core = None
+        else:
+            lum = rgb @ LUMA
+            hot = np.clip((lum - np.float32(0.70)) * np.float32(1.0 / 0.28), 0.0, None)
+            if float(hot.max()) <= 0.0:
+                return rgb
+            rgb_for_tint = rgb
+            sig_c = (2.2 + 3.2 * a) * max(0.65, sc)
+            core_v = lowpass(lowpass(hot, max(0.6, 0.72 * sig_c), axis=1), max(0.8, 1.38 * sig_c), axis=0)
+            core_h = lowpass(lowpass(hot, max(0.8, 1.25 * sig_c), axis=1), max(0.5, 0.68 * sig_c), axis=0)
+            core = np.float32(0.62) * core_v + np.float32(0.38) * core_h
+            sh_y = max(1, int(round(1.4 * sc)))
+            sh_x = max(1, int(round(1.2 * sc)))
+            core_coma = np.roll(np.roll(core_v, sh_y, axis=0), sh_x, axis=1)
+            core = np.float32(0.76) * core + np.float32(0.24) * core_coma
 
-        # Distinguish isolated point lamps (< 3% of frame) from broad reflective flash/daylight objects
-        hot_area_frac = float(np.mean(hot > 0.05))
+        hot_area_frac = float(np.mean(hot[::2, ::2] > 0.05))
         broad_damp = 1.0 / (1.0 + 35.0 * max(0.0, hot_area_frac - 0.030))
 
-        # 2. Scalloped 6-Petal Asymmetric Starburst Skirt (`peak/median >= 1.46x` angular modulation)
-        petal_src = lowpass(hot ** 1.15, max(0.9, 2.2 * sc))
-        petal_reach = (11.0 + 22.0 * a) * max(0.65, sc)
+        # 2. Scalloped 6-Petal Asymmetric Starburst Skirt (computed on 1/2 or 1/4 grid since petal_src is blurred by >=2.2*sc)
+        ds_p = 4 if (_have_cv and min(h, w) >= 900) else (2 if (_have_cv and min(h, w) >= 360) else 1)
+        if ds_p > 1:
+            hp, wp = max(4, h // ds_p), max(4, w // ds_p)
+            hot_p = _cv2.resize(hot, (wp, hp), interpolation=_cv2.INTER_AREA) if hot.shape != (hp, wp) else hot
+        else:
+            hp, wp = h, w
+            hot_p = hot
+        hot_p115 = hot_p * (np.float32(0.85) + np.float32(0.15) * hot_p)
+        petal_src = lowpass(hot_p115, max(0.5, 2.2 * sc / ds_p))
+        petal_reach = (11.0 + 22.0 * a) * max(0.65, sc) / ds_p
         petal_defs = (
             (36.0, 1.32, 1.08),
             (108.0, 1.22, 1.02),
@@ -995,42 +1038,41 @@ class CameraStage(Stage):
                 ix = int(round(-ux * dist))
                 shift_weights[(iy, ix)] = shift_weights.get((iy, ix), 0.0) + w_step
 
-        petal_skirt = np.zeros_like(hot)
+        petal_skirt_s = np.zeros_like(hot_p)
         for (iy, ix), w_step in shift_weights.items():
             ws = np.float32(w_step)
             if iy == 0 and ix == 0:
-                petal_skirt += petal_src * ws
+                petal_skirt_s += petal_src * ws
                 continue
             if iy >= 0:
-                sy0, sy1, dy0, dy1, ry = 0, max(0, h - iy), iy, h, 0
+                sy0, sy1, dy0, dy1, ry = 0, max(0, hp - iy), iy, hp, 0
             else:
-                sy0, sy1, dy0, dy1, ry = min(h, -iy), h, 0, max(0, h + iy), h - 1
+                sy0, sy1, dy0, dy1, ry = min(hp, -iy), hp, 0, max(0, hp + iy), hp - 1
             if ix >= 0:
-                sx0, sx1, dx0, dx1, rx = 0, max(0, w - ix), ix, w, 0
+                sx0, sx1, dx0, dx1, rx = 0, max(0, wp - ix), ix, wp, 0
             else:
-                sx0, sx1, dx0, dx1, rx = min(w, -ix), w, 0, max(0, w + ix), w - 1
+                sx0, sx1, dx0, dx1, rx = min(wp, -ix), wp, 0, max(0, wp + ix), wp - 1
             c_val = float(petal_src[ry, rx])
             if c_val != 0.0:
-                petal_skirt += np.float32(c_val * w_step)
+                petal_skirt_s += np.float32(c_val * w_step)
             if dy1 > dy0 and dx1 > dx0:
                 if c_val != 0.0:
-                    petal_skirt[dy0:dy1, dx0:dx1] += (petal_src[sy0:sy1, sx0:sx1] - np.float32(c_val)) * ws
+                    petal_skirt_s[dy0:dy1, dx0:dx1] += (petal_src[sy0:sy1, sx0:sx1] - np.float32(c_val)) * ws
                 else:
-                    petal_skirt[dy0:dy1, dx0:dx1] += petal_src[sy0:sy1, sx0:sx1] * ws
-
-        veil = lowpass(hot, (11.0 + 18.0 * a) * max(0.65, sc))
-        peak = float(core.max())
-        if peak > 1e-6:
-            core = core * np.float32(broad_damp / peak + (1.0 - broad_damp))
-        p_peak = float(petal_skirt.max())
-        if p_peak > 1e-6:
-            petal_skirt = petal_skirt * np.float32(broad_damp / p_peak + (1.0 - broad_damp))
+                    petal_skirt_s[dy0:dy1, dx0:dx1] += petal_src[sy0:sy1, sx0:sx1] * ws
+        v_sig = (11.0 + 18.0 * a) * max(0.65, sc)
+        if _have_cv and v_sig >= 4.0 and min(h, w) >= 128:
+            ds_v = 4 if v_sig >= 8.0 else 2
+            hot_v = _cv2.resize(hot_p, (max(4, w // ds_v), max(4, h // ds_v)), interpolation=_cv2.INTER_AREA)
+            veil_s = lowpass(hot_v, v_sig / ds_v)
+        else:
+            veil_s = lowpass(hot, v_sig)
 
         coverage = float(np.clip(hot.mean() * 14.0, 0.0, 1.0)) * broad_damp
 
         mass = float(hot.sum())
         if mass > 1e-6:
-            mean_rgb = (hot.ravel() @ rgb.reshape(-1, 3)) / mass
+            mean_rgb = (hot.ravel() @ rgb_for_tint.reshape(-1, 3)) / mass
             g = float(mean_rgb[1])
             if g > 1e-4:
                 src_tint = np.clip(mean_rgb / g, 0.55, 1.75).astype(np.float32)
@@ -1040,15 +1082,51 @@ class CameraStage(Stage):
             src_tint = np.ones(3, np.float32)
         lens_tint = np.array([1.02, 0.92, 1.12], dtype=np.float32)
         mix = float(np.clip(self.halation_source_colour, 0.0, 1.0))
-        tint = (1.0 - mix) * lens_tint + mix * src_tint
+        tint = ((1.0 - mix) * lens_tint + mix * src_tint).astype(np.float32)
+        outer_cyan = np.array([0.80, 1.04, 1.32], dtype=np.float32)
+        petal_tint = (0.55 * tint + 0.45 * outer_cyan).astype(np.float32)
+        scale_a = np.float32(a * 0.54)
 
-        # Outer petal fringe carries a subtle cool cyan-blue chromatic dispersion
-        outer_cyan = np.array([0.80, 1.04, 1.32], dtype=np.float32)[None, None, :]
-        halo_rgb = (
-            (0.64 * core + 0.24 * coverage * veil)[..., None] * tint[None, None, :]
-            + (0.42 * petal_skirt)[..., None] * (0.55 * tint[None, None, :] + 0.45 * outer_cyan)
-        )
-        return (rgb + (a * 0.54) * halo_rgb).astype(np.float32)
+        from ..core.signal import get_native_lib
+        lib = get_native_lib()
+        if ds_c > 1 and _have_cv and lib is not None and rgb.dtype == np.float32:
+            # Combine on (hc, wc) reduced grid and upsample-add in one C pass
+            peak_c = float(core_s.max())
+            if peak_c > 1e-6:
+                core_s = core_s * np.float32(broad_damp / peak_c + (1.0 - broad_damp))
+            p_peak_c = float(petal_skirt_s.max())
+            if p_peak_c > 1e-6:
+                petal_skirt_s = petal_skirt_s * np.float32(broad_damp / p_peak_c + (1.0 - broad_damp))
+            pet_c = _cv2.resize(petal_skirt_s, (wc, hc), interpolation=_cv2.INTER_LINEAR) if (petal_skirt_s.shape != (hc, wc)) else petal_skirt_s
+            veil_c = _cv2.resize(veil_s, (wc, hc), interpolation=_cv2.INTER_LINEAR) if (veil_s.shape != (hc, wc)) else veil_s
+            base_c = (np.float32(0.64) * core_s + np.float32(0.24 * coverage) * veil_c) * scale_a
+            pet_2d_c = (np.float32(0.42) * pet_c) * scale_a
+            delta_ds = np.ascontiguousarray(base_c[..., None] * tint[None, None, :] + pet_2d_c[..., None] * petal_tint[None, None, :], dtype=np.float32)
+            src_c = np.ascontiguousarray(rgb, dtype=np.float32)
+            out = np.empty_like(src_c)
+            lib.vml_upsample_add_rgb_f32(
+                src_c.ctypes.data, delta_ds.ctypes.data, out.ctypes.data,
+                h, w, hc, wc,
+            )
+            return out
+
+        petal_skirt = _cv2.resize(petal_skirt_s, (w, h), interpolation=_cv2.INTER_LINEAR) if ds_p > 1 else petal_skirt_s
+        veil = _cv2.resize(veil_s, (w, h), interpolation=_cv2.INTER_LINEAR) if veil_s.shape != (h, w) else veil_s
+        if core is None:
+            core = _cv2.resize(core_s, (w, h), interpolation=_cv2.INTER_LINEAR)
+        peak = float(core.max())
+        if peak > 1e-6:
+            core = core * np.float32(broad_damp / peak + (1.0 - broad_damp))
+        p_peak = float(petal_skirt.max())
+        if p_peak > 1e-6:
+            petal_skirt = petal_skirt * np.float32(broad_damp / p_peak + (1.0 - broad_damp))
+
+        base_2d = (np.float32(0.64) * core + np.float32(0.24 * coverage) * veil) * scale_a
+        pet_2d = (np.float32(0.42) * petal_skirt) * scale_a
+        out = rgb.copy()
+        for c in range(3):
+            out[..., c] += base_2d * tint[c] + pet_2d * petal_tint[c]
+        return out
 
     def _shadow_depth(self, rgb: np.ndarray) -> np.ndarray:
         """
@@ -1105,9 +1183,10 @@ class CameraStage(Stage):
         """
         from ..codecs.nightvision import mode_of
         raw_amt = float(np.clip(getattr(self, "highlight_compress", 1.0), 0.0, 6.0))
-        if mode_of(self.nv) == "off" and abs(raw_amt - 1.0) < 1e-4:
-            return np.clip(rgb, 0.0, 1.0).astype(np.float32)
-        if raw_amt <= 1e-4:
+        if (mode_of(self.nv) == "off" and abs(raw_amt - 1.0) < 1e-4) or raw_amt <= 1e-4:
+            if rgb.dtype == np.float32 and rgb.flags.c_contiguous:
+                np.clip(rgb, 0.0, 1.0, out=rgb)
+                return rgb
             return np.clip(rgb, 0.0, 1.0).astype(np.float32)
         amt = float(np.clip(raw_amt, 0.0, 1.0))
         knee = float(np.clip(getattr(self, "highlight_knee", 0.70), 0.5, 0.99))
@@ -1485,32 +1564,59 @@ class CameraStage(Stage):
                 mix_c = float(np.clip((self.color_cast - 0.20) / 0.25, 0.0, 1.0))
                 return (rgb * (1.0 - mix_c) + np.clip(cfa_rgb, 0.0, 1.0) * mix_c).astype(np.float32)
 
+        c_cast = float(self.color_cast)
+        ht_t = float(self.highlight_tint)
+        if abs(c_cast) <= 1e-4 and ht_t <= 1e-4:
+            return out.astype(np.float32, copy=False)
+        from ..core.signal import get_native_lib
+        lib = get_native_lib()
+        if lib is not None and out.ndim == 3 and out.shape[2] == 3 and out.dtype == np.float32:
+            gr = float(1.0 - 0.16 * c_cast) if abs(c_cast) > 1e-4 else 1.0
+            gg = float(1.0 + 0.03 * c_cast) if abs(c_cast) > 1e-4 else 1.0
+            gb = float(1.0 + 0.20 * c_cast) if abs(c_cast) > 1e-4 else 1.0
+            is_cyan = 1 if (c_cast > 0.08 and float(getattr(self, "wb_temp", 0.0)) < -0.01) else 0
+            src_c = np.ascontiguousarray(out, dtype=np.float32)
+            dst_c = np.empty_like(src_c)
+            lib.vml_color_science_fast_f32(
+                src_c.ctypes.data, dst_c.ctypes.data,
+                src_c.shape[0] * src_c.shape[1],
+                gr, gg, gb, ht_t if ht_t > 1e-4 else 0.0, is_cyan, 0,
+            )
+            return dst_c
+
         if abs(self.color_cast) > 1e-4:
             c = float(self.color_cast)
-            # +1 cool/cyan (R down, B up, G slightly up); -1 warm (R up, B down)
             gains = np.array([1.0 - 0.16 * c, 1.0 + 0.03 * c, 1.0 + 0.20 * c],
                              dtype=np.float32)
             out = out * gains[None, None, :]
         if self.highlight_tint > 1e-4:
             t = float(self.highlight_tint)
-            lum = out @ np.array([0.299, 0.587, 0.114], dtype=np.float32)
-            over = np.clip((lum - 0.72) / 0.24, 0.0, 1.0)
-            # When color_cast > 0.10 and white_balance_temp < 0 (1986 first-gen complementary-mosaic CCD
-            # daylight response, calibrated against Panasonic CCD + NV-180 footage `10月16日.mp4`):
-            # In Ye/Cy/Mg/Gr difference decoding (`R = (Ye+Mg)-(Cy+Gr)`), the Cy+Gr photodiodes saturate
-            # later than Ye+Mg on bright sky/water highlights, pulling overexposed sky highlights into
-            # saturated cyan-blue (`R/G ~ 0.60, B/G ~ 1.03`) while midtone warm yellows/reds stay intact.
-            if self.color_cast > 0.08 and float(getattr(self, "wb_temp", 0.0)) < -0.01:
-                cool_mask = np.clip((out[..., 2] - out[..., 0] - 0.05) / 0.20, 0.0, 1.0)
-                w_cyan = (over * cool_mask)[..., None]
-                cyan_tint = np.array([1.0 - 0.32 * t, 1.0 + 0.08 * t, 1.0 + 0.12 * t], dtype=np.float32)
-                out = out * (1.0 - w_cyan) + np.clip(out * cyan_tint[None, None, :], 0.0, 1.0) * w_cyan
-            else:
-                over_3d = over[..., None]
-                tint = np.array([1.0 + 0.07 * t, 1.0 - 0.12 * t, 1.0 + 0.10 * t],
-                                dtype=np.float32)
-                out = out * (1.0 - over_3d) + out * tint[None, None, :] * over_3d
-        return out.astype(np.float32)
+            is_cyan_mode = (self.color_cast > 0.08 and float(getattr(self, "wb_temp", 0.0)) < -0.01)
+            sub = out[::2, ::4]
+            lum_s = sub @ LUMA
+            act = (lum_s > 0.70) & ((sub[..., 2] - sub[..., 0]) > 0.04) if is_cyan_mode else (lum_s > 0.70)
+            if np.any(act):
+                if not abs(self.color_cast) > 1e-4:
+                    out = out.copy()
+                r_idx = np.flatnonzero(np.any(act, axis=1))
+                c_idx = np.flatnonzero(np.any(act, axis=0))
+                r0 = max(0, int(r_idx[0]) * 2 - 2)
+                r1 = min(out.shape[0], int(r_idx[-1]) * 2 + 4)
+                c0 = max(0, int(c_idx[0]) * 4 - 4)
+                c1 = min(out.shape[1], int(c_idx[-1]) * 4 + 6)
+                band = out[r0:r1, c0:c1]
+                lum_b = band @ LUMA
+                over_b = np.clip((lum_b - np.float32(0.72)) * np.float32(1.0 / 0.24), 0.0, 1.0)
+                if is_cyan_mode:
+                    cool_b = np.clip((band[..., 2] - band[..., 0] - np.float32(0.05)) * np.float32(5.0), 0.0, 1.0)
+                    wc_b = (over_b * cool_b)[..., None]
+                    cyan_tint = np.array([1.0 - 0.32 * t, 1.0 + 0.08 * t, 1.0 + 0.12 * t], dtype=np.float32)[None, None, :]
+                    band += wc_b * (np.clip(band * cyan_tint, 0.0, 1.0) - band)
+                else:
+                    over_3d = over_b[..., None]
+                    tint_d = np.array([0.07 * t, -0.12 * t, 0.10 * t], dtype=np.float32)[None, None, :]
+                    band += (band * tint_d) * over_3d
+        return out.astype(np.float32, copy=False)
 
     def _color_cleanup(self, rgb: np.ndarray) -> np.ndarray:
         """
@@ -1539,34 +1645,55 @@ class CameraStage(Stage):
     def _signal_noise_envelope(self, rgb: np.ndarray, need_chroma: bool = True) -> tuple[np.ndarray, np.ndarray]:
         """
         Physical SONY DCR-TRV310E Non-Uniform Signal-Dependent Noise Envelope (`env_luma`, `env_chroma`).
-
-        Calibrated across luminance bins on `328073600181017743.jpeg`, `4081604481662954477.jpeg`,
-        and `862831116-1416402190.jpeg`:
-          1. **Dead-Black Night Sky (`L < 0.035`)**: DSP dark-pedestal coring + DV25 8x8 DCT dead-zone
-             suppresses noise down to `~0.06` (`Y_std ~ 0.0016` in real captures).
-          2. **Mid-Dark Surfaces & Glowing Halo Skirts (`L in [0.08, 0.85]`)**: Photon shot noise (`sqrt(L)`)
-             amplified by high AGC gain + 8x8 DV macroblock quantization reaches `1.15..1.45` (`Y_std` 4x-10x
-             higher than in the pitch-black sky!).
-          3. **Saturated Highlight Cores (`L > 0.88`)**: CCD full-well capacity saturation and ADC white
-             clipping flatten variance back down to `~0.05` (`Y_std ~ 0.0033` inside lamp cores).
+        Accelerated via precomputed 1537-entry float32 LUTs over [0.0, 1.5].
         """
-        lum = np.clip(rgb @ LUMA, 0.0, 1.5)
-        peak_ch = np.clip(rgb.max(axis=-1), 0.0, 1.5)
-        # 1. Dark-pedestal coring gate (suppresses noise in L < 0.035 dead-black night sky)
-        dark_core = 0.055 + 0.945 * (np.clip((lum - 0.018) / 0.068, 0.0, 1.0) ** 1.35)
-        # 2. Photon shot + AGC mid-dark & halo-skirt bell boost (peaks across L = 0.12..0.80)
-        shot_agc = 0.74 + 0.72 * np.sin(np.clip((lum - 0.03) / 0.85, 0.0, 1.0) * np.pi)
-        # 3. Full-well highlight saturation clamp (suppresses noise inside L > 0.88 blown cores)
-        sat_level = np.maximum(lum, peak_ch * 0.95)
-        sat_clamp = 1.0 - 0.95 * (np.clip((sat_level - 0.84) / 0.13, 0.0, 1.0) ** 1.25)
+        luts = getattr(CameraStage, "_NOISE_ENV_LUTS", None)
+        if luts is None:
+            x_lut = np.linspace(0.0, 1.5, 1537, dtype=np.float32)
+            dark_lut = (0.055 + 0.945 * (np.clip((x_lut - 0.018) / 0.068, 0.0, 1.0) ** 1.35)).astype(np.float32)
+            shot_lut = (0.74 + 0.72 * np.sin(np.clip((x_lut - 0.03) / 0.85, 0.0, 1.0) * np.pi)).astype(np.float32)
+            luma_prod_lut = (dark_lut * shot_lut).astype(np.float32)
+            chroma_prod_lut = (dark_lut * (0.65 + 0.78 * np.sin(np.clip((x_lut - 0.025) / 0.72, 0.0, 1.0) * np.pi))).astype(np.float32)
+            sat_clamp_lut = (1.0 - 0.95 * (np.clip((x_lut - 0.84) / 0.13, 0.0, 1.0) ** 1.25)).astype(np.float32)
+            luts = (luma_prod_lut, chroma_prod_lut, sat_clamp_lut)
+            CameraStage._NOISE_ENV_LUTS = luts
 
-        base_gate = (dark_core * sat_clamp).astype(np.float32, copy=False)
-        env_luma = (base_gate * shot_agc).astype(np.float32, copy=False)
+        luma_prod_lut, chroma_prod_lut, sat_clamp_lut = luts
+        from ..core.signal import get_native_lib
+        lib = get_native_lib()
+        if lib is not None and rgb.ndim == 3 and rgb.shape[2] == 3 and rgb.dtype == np.float32:
+            src_c = np.ascontiguousarray(rgb, dtype=np.float32)
+            h, w = src_c.shape[0], src_c.shape[1]
+            env_luma = np.empty((h, w), dtype=np.float32)
+            env_chroma = np.empty((h, w), dtype=np.float32) if need_chroma else None
+            lib.vml_signal_noise_envelope_f32(
+                src_c.ctypes.data,
+                luma_prod_lut.ctypes.data,
+                chroma_prod_lut.ctypes.data,
+                sat_clamp_lut.ctypes.data,
+                env_luma.ctypes.data,
+                env_chroma.ctypes.data if env_chroma is not None else None,
+                h * w,
+                1 if need_chroma else 0,
+            )
+            return env_luma, (env_chroma if env_chroma is not None else env_luma)
+
+        lum = np.clip(rgb @ LUMA, 0.0, 1.5)
+        try:
+            import cv2 as _cv2
+            peak_ch = _cv2.max(_cv2.max(rgb[..., 0], rgb[..., 1]), rgb[..., 2])
+            sat_level = np.clip(_cv2.max(lum, peak_ch * np.float32(0.95)), 0.0, 1.5)
+        except Exception:
+            peak_ch = np.clip(rgb.max(axis=-1), 0.0, 1.5)
+            sat_level = np.clip(np.maximum(lum, peak_ch * np.float32(0.95)), 0.0, 1.5)
+
+        idx_l = (lum * np.float32(1024.0)).astype(np.int32)
+        idx_s = (sat_level * np.float32(1024.0)).astype(np.int32)
+        sat_c = sat_clamp_lut[idx_s]
+        env_luma = luma_prod_lut[idx_l] * sat_c
         if not need_chroma:
             return env_luma, env_luma
-        # Chroma mottle peaks in dark-to-midtone surfaces & inner halo skirts (L = 0.06..0.65)
-        chroma_bell = np.float32(0.65) + np.float32(0.78) * np.sin(np.clip((lum - np.float32(0.025)) * np.float32(1.0 / 0.72), 0.0, 1.0) * np.float32(np.pi))
-        env_chroma = (base_gate * chroma_bell).astype(np.float32, copy=False)
+        env_chroma = chroma_prod_lut[idx_l] * sat_c
         return env_luma, env_chroma
 
     def _gain_noise(self, rgb: np.ndarray, frame_index: int, scale_mult: float = 1.0) -> np.ndarray:
@@ -1801,8 +1928,8 @@ class CameraStage(Stage):
         if s < 1.0:
             return lowpass(rgb, (1.0 + (1.0 - s) * 1.6) * scale_w)
         amount = (s - 1.0) * 0.9
-        blurred = lowpass(rgb, 0.9 * scale_w)
-        return (rgb + amount * (rgb - blurred)).astype(np.float32)
+        from ..core.signal import unsharp_mask_2d
+        return unsharp_mask_2d(rgb, 0.9 * scale_w, amount)
 
     # ------------------------------------------------------------------
     def apply(self, buf: FrameBuffer) -> FrameBuffer:
@@ -1950,21 +2077,67 @@ class CameraStage(Stage):
             # Automatic gain control (AGC) boosts analog gain as f-number narrows toward T
             self.gain = float(self.gain + 0.32 * (eff_wt_zoom ** 1.15))
 
-        rgb = self._white_balance(rgb)
-        rgb = self._expose(rgb)
+        from ..core.signal import get_native_lib
+        _lib_wbe = get_native_lib()
+        if _lib_wbe is not None and rgb.ndim == 3 and rgb.shape[2] == 3 and rgb.dtype == np.float32:
+            gains = np.ones(3, np.float32)
+            if abs(self.wb_temp) > 1e-4:
+                t_wb = float(self.wb_temp)
+                gains = gains * np.array([1.0 + 0.18 * t_wb, 1.0 + 0.02 * t_wb, 1.0 - 0.20 * t_wb], dtype=np.float32)
+            loop_gains = getattr(self, "_awb_gains", None)
+            if self.awb_enabled and loop_gains is not None:
+                gains = gains * np.asarray(loop_gains, np.float32)
+            exp_mult = float(2.0 ** self.exposure) if abs(self.exposure) >= 1e-4 else 1.0
+            sr, sg, sb = float(gains[0] * exp_mult), float(gains[1] * exp_mult), float(gains[2] * exp_mult)
+            has_mb = (self.motion_blur > 1e-4 and self._prev is not None and self._prev.shape == rgb.shape)
+            mb_k = float(np.clip(self.motion_blur, 0.0, 0.95)) if has_mb else 0.0
+            if abs(sr - 1.0) > 1e-6 or abs(sg - 1.0) > 1e-6 or abs(sb - 1.0) > 1e-6 or has_mb:
+                src_c = np.ascontiguousarray(rgb, dtype=np.float32)
+                prv_c = np.ascontiguousarray(self._prev, dtype=np.float32) if has_mb else None
+                dst_c = np.empty_like(src_c)
+                _lib_wbe.vml_camera_wb_expose_blur_f32(
+                    src_c.ctypes.data,
+                    prv_c.ctypes.data if prv_c is not None else None,
+                    dst_c.ctypes.data,
+                    src_c.shape[0] * src_c.shape[1],
+                    sr, sg, sb, mb_k,
+                )
+                rgb = dst_c
+        else:
+            rgb = self._white_balance(rgb)
+            rgb = self._expose(rgb)
+            if self.motion_blur > 1e-4 and self._prev is not None and self._prev.shape == rgb.shape:
+                k = float(np.clip(self.motion_blur, 0.0, 0.95))
+                rgb = (rgb * (1.0 - k) + self._prev * k).astype(np.float32)
 
-        if self.motion_blur > 1e-4 and self._prev is not None and self._prev.shape == rgb.shape:
-            k = float(np.clip(self.motion_blur, 0.0, 0.95))
-            rgb = (rgb * (1.0 - k) + self._prev * k).astype(np.float32)
-
-        if self.sensor_noise > 1e-4:
-            n = self._noise_field(rgb.shape[:2]).sample(buf.index)
+        if self.sensor_noise > 1e-4 or self.fixed_pattern > 1e-4:
             env_sn, _ = self._signal_noise_envelope(rgb, need_chroma=False)
-            rgb = rgb + (self.sensor_noise * 0.35) * (n * env_sn)[..., None]
-
-        if self.fixed_pattern > 1e-4:
-            env_fp, _ = self._signal_noise_envelope(rgb, need_chroma=False)
-            rgb = rgb + (self.fixed_pattern * 0.06) * self._fixed_pattern(rgb.shape[:2]) * (0.25 + 0.75 * env_fp[..., None])
+            n_2d = self._noise_field(rgb.shape[:2]).sample(buf.index) if self.sensor_noise > 1e-4 else None
+            fpn_3d = self._fixed_pattern(rgb.shape[:2]) if self.fixed_pattern > 1e-4 else None
+            from ..core.signal import get_native_lib
+            lib = get_native_lib()
+            if lib is not None and rgb.dtype == np.float32:
+                src_c = np.ascontiguousarray(rgb, dtype=np.float32)
+                dst_c = np.empty_like(src_c)
+                n_c = np.ascontiguousarray(n_2d, dtype=np.float32) if n_2d is not None else None
+                fp_c = np.ascontiguousarray(fpn_3d, dtype=np.float32) if fpn_3d is not None else None
+                env_c = np.ascontiguousarray(env_sn, dtype=np.float32)
+                lib.vml_camera_apply_sensor_fpn_f32(
+                    src_c.ctypes.data, dst_c.ctypes.data,
+                    n_c.ctypes.data if n_c is not None else None,
+                    fp_c.ctypes.data if fp_c is not None else None,
+                    env_c.ctypes.data,
+                    1.0, 1.0, 1.0, 1.0,
+                    float(self.sensor_noise * 0.35) if n_c is not None else 0.0,
+                    float(self.fixed_pattern * 0.06) if fp_c is not None else 0.0,
+                    src_c.shape[0] * src_c.shape[1],
+                )
+                rgb = dst_c
+            else:
+                if n_2d is not None:
+                    rgb = rgb + np.float32(self.sensor_noise * 0.35) * (n_2d * env_sn)[..., None]
+                if fpn_3d is not None:
+                    rgb = rgb + np.float32(self.fixed_pattern * 0.06) * fpn_3d * (np.float32(0.25) + np.float32(0.75) * env_sn[..., None])
 
         # Pre-halo sensor readout fraction (30%); the remaining 70% CDS/AGC + CFA mottle runs after
         # optical halation & CCD smear so glowing halo skirts carry realistic signal-dependent grain
@@ -2043,9 +2216,13 @@ class CameraStage(Stage):
             eff_lens = self.lens
 
         rgb = distortion(rgb, eff_lens)
-        rgb = chromatic_aberration(rgb, eff_lens)
-        rgb = field_curvature(rgb, eff_lens)
-        rgb = longitudinal_ca(rgb, eff_lens)
+        if eff_lens.field_curvature < 1e-4:
+            from ..codecs.lens import chromatic_and_longitudinal_ca
+            rgb = chromatic_and_longitudinal_ca(rgb, eff_lens)
+        else:
+            rgb = chromatic_aberration(rgb, eff_lens)
+            rgb = field_curvature(rgb, eff_lens)
+            rgb = longitudinal_ca(rgb, eff_lens)
         rgb = coma(rgb, eff_lens)
         rgb = astigmatism(rgb, eff_lens)
         # **Scattered light first, because it is the widest and softest of the light mechanisms.**  A halo
@@ -2101,7 +2278,7 @@ class CameraStage(Stage):
         out_meta = dict(buf.meta)
         # --- Module 3: Shared Power & Electrical Bus coupling on Camera ---
         from ..codecs.power_bus import evaluate_power_bus, apply_camera_power_effects
-        row_lum_cam = (np.clip(rgb, 0.0, 1.0) @ LUMA).mean(axis=1)
+        row_lum_cam = np.clip(rgb[::2, ::4].mean(axis=1), 0.0, 1.0) @ LUMA
         pstate = evaluate_power_bus(
             self.ctx.params, int(buf.index), self.ctx.fps,
             rgb.shape[0], rgb.shape[1], self.ctx.seed,
@@ -2136,8 +2313,12 @@ class CameraStage(Stage):
                 seed=int(self.ctx.seed) + 307,
             )
             out_meta["mobile_camera_isp"] = m_info
-        out_clipped = np.clip(rgb, 0.0, 1.0).astype(np.float32)
-        out_meta["tap_camera_rgb"] = out_clipped
-        return FrameBuffer(np.clip(rgb, 0.0, 2.0).astype(np.float32), None,
+        if rgb.dtype == np.float32 and rgb.flags.c_contiguous:
+            np.clip(rgb, 0.0, 2.0, out=rgb)
+            out_rgb = rgb
+        else:
+            out_rgb = np.clip(rgb, 0.0, 2.0).astype(np.float32, copy=False)
+        out_meta["tap_camera_rgb"] = out_rgb
+        return FrameBuffer(out_rgb, None,
                            buf.index, buf.time, buf.std, out_meta)
 

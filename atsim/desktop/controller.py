@@ -603,18 +603,18 @@ class DesktopBackendController:
             return wav_bytes, tl
 
     def export_full_audio_wav(self, out_path: str) -> str:
-        """Render the full clip duration audio to a WAV file."""
+        """Render the full clip duration audio to a WAV file in bounded-memory 30s chunks."""
         with self._lock:
             tel = self.get_telemetry()
             dur = max(1.0, float(tel.get("duration") or 4.0))
-            wav_bytes = self.app.audio_wav(
+            self.app.export_audio_wav_file(
+                out_path,
                 start_s=0.0,
                 duration_s=dur,
                 mode="source" if self.audio_clean else "sim",
                 sample_rate=44100,
                 clean=self.audio_clean,
             )
-            Path(out_path).write_bytes(wav_bytes)
             self._enforce_low_memory_caches()
             return out_path
 
